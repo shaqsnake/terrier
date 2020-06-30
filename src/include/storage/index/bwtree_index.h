@@ -1,17 +1,29 @@
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
-#include "bwtree/bwtree.h"
-#include "catalog/catalog_defs.h"
-#include "storage/index/compact_ints_key.h"
+
+#include "common/managed_pointer.h"
 #include "storage/index/index.h"
 #include "storage/index/index_defs.h"
-#include "storage/index/index_metadata.h"
-#include "storage/sql_table.h"
-#include "storage/storage_defs.h"
+
+namespace terrier::transaction {
+class TransactionContext;
+}
+
+namespace third_party::bwtree {  // NOLINT: check censored doesn't like this namespace name
+template <typename KeyType, typename ValueType, typename KeyComparator, typename KeyEqualityChecker,
+          typename KeyHashFunc, typename ValueEqualityChecker, typename ValueHashFunc>
+class BwTree;
+}
 
 namespace terrier::storage::index {
+template <uint8_t KeySize>
+class CompactIntsKey;
+template <uint16_t KeySize>
+class GenericKey;
 
 /**
  * Wrapper around Ziqi's OpenBwTree.
@@ -22,72 +34,51 @@ class BwTreeIndex final : public Index {
   friend class IndexBuilder;
 
  private:
-  BwTreeIndex(const catalog::index_oid_t oid, const ConstraintType constraint_type, IndexMetadata metadata)
-      : Index(oid, constraint_type, std::move(metadata)),
-        bwtree_{new third_party::bwtree::BwTree<KeyType, TupleSlot>{false}} {}
+  explicit BwTreeIndex(IndexMetadata metadata);
 
-  third_party::bwtree::BwTree<KeyType, TupleSlot> *const bwtree_;
+  const std::unique_ptr<third_party::bwtree::BwTree<
+      KeyType, TupleSlot, std::less<KeyType>,  // NOLINT transparent functors can't figure out template
+      std::equal_to<KeyType>,                  // NOLINT transparent functors can't figure out template
+      std::hash<KeyType>, std::equal_to<TupleSlot>, std::hash<TupleSlot>>>
+      bwtree_;
 
  public:
-  ~BwTreeIndex() final { delete bwtree_; }
+  IndexType Type() const final { return IndexType::BWTREE; }
 
-  bool Insert(const ProjectedRow &tuple, const TupleSlot location) final {
-    TERRIER_ASSERT(GetConstraintType() == ConstraintType::DEFAULT,
-                   "This Insert is designed for secondary indexes with no uniqueness constraints.");
-    KeyType index_key;
-    index_key.SetFromProjectedRow(tuple, metadata_);
-    return bwtree_->Insert(index_key, location, false);
-  }
+  void PerformGarbageCollection() final;
 
-  bool Delete(const ProjectedRow &tuple, const TupleSlot location) final {
-    KeyType index_key;
-    index_key.SetFromProjectedRow(tuple, metadata_);
-    return bwtree_->Delete(index_key, location);
-  }
+  size_t EstimateHeapUsage() const final;
 
-  bool ConditionalInsert(const ProjectedRow &tuple, const TupleSlot location,
-                         std::function<bool(const TupleSlot)> predicate) final {
-    TERRIER_ASSERT(GetConstraintType() == ConstraintType::UNIQUE,
-                   "This Insert is designed for indexes with uniqueness constraints.");
-    KeyType index_key;
-    index_key.SetFromProjectedRow(tuple, metadata_);
-    bool predicate_satisfied = false;
+  bool Insert(common::ManagedPointer<transaction::TransactionContext> txn, const ProjectedRow &tuple,
+              TupleSlot location) final;
 
-    // predicate is set to nullptr if the predicate returns true for some value
-    const bool ret = bwtree_->ConditionalInsert(index_key, location, predicate, &predicate_satisfied);
+  bool InsertUnique(common::ManagedPointer<transaction::TransactionContext> txn, const ProjectedRow &tuple,
+                    TupleSlot location) final;
 
-    // if predicate is not satisfied then we know insertion succeeds
-    if (!predicate_satisfied) {
-      TERRIER_ASSERT(ret, "Insertion should always succeed. (Ziqi)");
-    } else {
-      TERRIER_ASSERT(!ret, "Insertion should always fail. (Ziqi)");
-    }
+  void Delete(common::ManagedPointer<transaction::TransactionContext> txn, const ProjectedRow &tuple,
+              TupleSlot location) final;
 
-    return ret;
-  }
+  void ScanKey(const transaction::TransactionContext &txn, const ProjectedRow &key,
+               std::vector<TupleSlot> *value_list) final;
 
-  void ScanKey(const ProjectedRow &key, std::vector<TupleSlot> *value_list) final {
-    TERRIER_ASSERT(
-        value_list->empty(),
-        "Result set should begin empty. This can be changed in the future if index scan behavior requires it.");
-    KeyType index_key;
-    index_key.SetFromProjectedRow(key, metadata_);
-    bwtree_->GetValue(index_key, *value_list);
-  }
+  void ScanAscending(const transaction::TransactionContext &txn, ScanType scan_type, uint32_t num_attrs,
+                     ProjectedRow *low_key, ProjectedRow *high_key, uint32_t limit,
+                     std::vector<TupleSlot> *value_list) final;
 
-  void Scan(const ProjectedRow &low_key, const ProjectedRow &high_key, std::vector<TupleSlot> *value_list) final {
-    TERRIER_ASSERT(
-        value_list->empty(),
-        "Result set should begin empty. This can be changed in the future if index scan behavior requires it.");
-    KeyType index_low_key, index_high_key;
-    index_low_key.SetFromProjectedRow(low_key, metadata_);
-    index_high_key.SetFromProjectedRow(high_key, metadata_);
+  void ScanDescending(const transaction::TransactionContext &txn, const ProjectedRow &low_key,
+                      const ProjectedRow &high_key, std::vector<TupleSlot> *value_list) final;
 
-    for (auto scan_itr = bwtree_->Begin(index_low_key);
-         !scan_itr.IsEnd() && (bwtree_->KeyCmpLessEqual(scan_itr->first, index_high_key)); scan_itr++) {
-      value_list->emplace_back(scan_itr->second);
-    }
-  }
+  void ScanLimitDescending(const transaction::TransactionContext &txn, const ProjectedRow &low_key,
+                           const ProjectedRow &high_key, std::vector<TupleSlot> *value_list, uint32_t limit) final;
 };
+
+extern template class BwTreeIndex<CompactIntsKey<8>>;
+extern template class BwTreeIndex<CompactIntsKey<16>>;
+extern template class BwTreeIndex<CompactIntsKey<24>>;
+extern template class BwTreeIndex<CompactIntsKey<32>>;
+
+extern template class BwTreeIndex<GenericKey<64>>;
+extern template class BwTreeIndex<GenericKey<128>>;
+extern template class BwTreeIndex<GenericKey<256>>;
 
 }  // namespace terrier::storage::index

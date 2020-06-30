@@ -4,7 +4,6 @@
 #include <string>
 #include <utility>
 #include "common/allocator.h"
-#include "common/container/concurrent_queue.h"
 #include "common/spin_latch.h"
 #include "common/strong_typedef.h"
 
@@ -70,7 +69,7 @@ class ObjectPool {
    * @param size_limit the maximum number of objects the object pool controls
    * @param reuse_limit the maximum number of reusable objects
    */
-  ObjectPool(const uint64_t size_limit, const uint64_t reuse_limit)
+  ObjectPool(uint64_t size_limit, uint64_t reuse_limit)
       : size_limit_(size_limit), reuse_limit_(reuse_limit), current_size_(0) {}
 
   /**
@@ -176,6 +175,11 @@ class ObjectPool {
       reuse_queue_.push(obj);
     }
   }
+
+  /**
+   * @return size limit of the object pool
+   */
+  uint64_t GetSizeLimit() const { return size_limit_; }
 
  private:
   Allocator alloc_;

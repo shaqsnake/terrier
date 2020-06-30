@@ -1,13 +1,13 @@
 #pragma once
 
 #include <memory>
-#include "spdlog/sinks/basic_file_sink.h"
-#include "spdlog/spdlog.h"
+
+#include "loggers/loggers_util.h"
 
 namespace terrier::storage {
-extern std::shared_ptr<spdlog::logger> index_logger;
+extern std::shared_ptr<spdlog::logger> index_logger;  // NOLINT
 
-void init_index_logger();
+void InitIndexLogger();
 }  // namespace terrier::storage
 
 #define INDEX_LOG_TRACE(...) ::terrier::storage::index_logger->trace(__VA_ARGS__);

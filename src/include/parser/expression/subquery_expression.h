@@ -8,9 +8,8 @@
 #include "type/type_id.h"
 
 namespace terrier::parser {
-
 /**
- * Represents a sub-select query.
+ * SubqueryExpression represents an expression which contains a select statement ("sub-select").
  */
 class SubqueryExpression : public AbstractExpression {
  public:
@@ -18,47 +17,60 @@ class SubqueryExpression : public AbstractExpression {
    * Instantiates a new SubqueryExpression with the given sub-select from the parser.
    * @param subselect the sub-select
    */
-  explicit SubqueryExpression(std::shared_ptr<parser::SelectStatement> subselect)
+  explicit SubqueryExpression(std::unique_ptr<parser::SelectStatement> subselect)
       : AbstractExpression(ExpressionType::ROW_SUBQUERY, type::TypeId::INVALID, {}), subselect_(std::move(subselect)) {}
 
-  /**
-   * Default constructor for deserialization
-   */
+  /** Default constructor for JSON deserialization. */
   SubqueryExpression() = default;
 
-  std::shared_ptr<AbstractExpression> Copy() const override {
-    // TODO(WAN): Previous codebase described as a hack, will we need a deep copy?
-    // Tianyu: No need for deep copy if your objects are always immutable! (why even copy at all, but that's beyond me)
-    return std::make_shared<SubqueryExpression>(*this);
-  }
+  /**
+   * Copies this SubqueryExpression
+   * @returns copy of this
+   */
+  std::unique_ptr<AbstractExpression> Copy() const override;
 
   /**
-   * @return shared pointer to stored sub-select
+   * Creates a copy of the current AbstractExpression with new children implanted.
+   * The children should not be owned by any other AbstractExpression.
+   * @param children New children to be owned by the copy
+   * @returns copy of this with new children
    */
-  std::shared_ptr<parser::SelectStatement> GetSubselect() { return subselect_; }
-
-  /**
-   * @return expression serialized to json
-   */
-  nlohmann::json ToJson() const override {
-    nlohmann::json j = AbstractExpression::ToJson();
-    j["subselect"] = subselect_;
-    return j;
+  std::unique_ptr<AbstractExpression> CopyWithChildren(
+      std::vector<std::unique_ptr<AbstractExpression>> &&children) const override {
+    TERRIER_ASSERT(children.empty(), "SubqueryExpression should have 0 children");
+    return Copy();
   }
 
+  /** @return managed pointer to the sub-select */
+  common::ManagedPointer<parser::SelectStatement> GetSubselect() { return common::ManagedPointer(subselect_); }
+
+  void Accept(common::ManagedPointer<binder::SqlNodeVisitor> v) override { v->Visit(common::ManagedPointer(this)); }
+
   /**
-   * @param j json to deserialize
+   * TODO(WAN): document the depths, ask Ling
+   * @return Derived depth of the expression
    */
-  void FromJson(const nlohmann::json &j) override {
-    AbstractExpression::FromJson(j);
-    subselect_ = std::make_shared<parser::SelectStatement>();
-    subselect_->FromJson(j.at("subselect"));
+  int DeriveDepth() override;
+
+  common::hash_t Hash() const override;
+
+  bool operator==(const AbstractExpression &rhs) const override {
+    if (!AbstractExpression::operator==(rhs)) return false;
+    auto const &other = dynamic_cast<const SubqueryExpression &>(rhs);
+    return *subselect_ == *(other.subselect_);
   }
+
+  /** @return expression serialized to json */
+  nlohmann::json ToJson() const override;
+
+  /** @param j json to deserialize */
+  std::vector<std::unique_ptr<AbstractExpression>> FromJson(const nlohmann::json &j) override;
 
  private:
-  std::shared_ptr<parser::SelectStatement> subselect_;
+  /** Sub-select statement. */
+  std::unique_ptr<SelectStatement> subselect_;
 };
 
-DEFINE_JSON_DECLARATIONS(SubqueryExpression);
+DEFINE_JSON_HEADER_DECLARATIONS(SubqueryExpression);
 
 }  // namespace terrier::parser

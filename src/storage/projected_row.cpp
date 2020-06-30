@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "storage/block_layout.h"
+
 namespace terrier::storage {
 ProjectedRow *ProjectedRow::CopyProjectedRowLayout(void *head, const ProjectedRow &other) {
   auto *result = reinterpret_cast<ProjectedRow *>(head);
@@ -16,8 +18,7 @@ ProjectedRow *ProjectedRow::CopyProjectedRowLayout(void *head, const ProjectedRo
   return result;
 }
 
-template <typename AttrType>
-ProjectedRowInitializer::ProjectedRowInitializer(const std::vector<AttrType> &attr_sizes, std::vector<col_id_t> col_ids)
+ProjectedRowInitializer::ProjectedRowInitializer(const std::vector<uint16_t> &attr_sizes, std::vector<col_id_t> col_ids)
     : col_ids_(std::move(col_ids)), offsets_(col_ids_.size()) {
   TERRIER_ASSERT(!col_ids_.empty(), "Cannot initialize an empty ProjectedRow.");
   TERRIER_ASSERT(col_ids_.size() == attr_sizes.size(), "Attribute sizes should correspond to the column indexes");
@@ -33,7 +34,7 @@ ProjectedRowInitializer::ProjectedRowInitializer(const std::vector<AttrType> &at
   // space needed to store value offsets, we don't need to pad as we're using a regular non-concurrent bitmap
   size_ = size_ + static_cast<uint32_t>(col_ids_.size() * sizeof(uint32_t));
   // Pad up to either the first value's size, or 8 bytes if the value is larger than 8
-  auto first_alignment = static_cast<uint8_t>(std::min(attr_sizes[0], static_cast<AttrType>(sizeof(uint64_t))));
+  auto first_alignment = static_cast<uint16_t>(std::min(attr_sizes[0], static_cast<uint16_t>(sizeof(uint64_t))));
   // space needed to store the bitmap, padded up to the size of the first value in this projected row
   size_ = StorageUtil::PadUpToSize(first_alignment,
                                    size_ + common::RawBitmap::SizeInBytes(static_cast<uint32_t>(col_ids_.size())));
@@ -41,9 +42,9 @@ ProjectedRowInitializer::ProjectedRowInitializer(const std::vector<AttrType> &at
     offsets_[i] = size_;
     // Pad up to either the next value's size, or 8 bytes at the end of the ProjectedRow, or 8 byte if the value
     // is larger than 8
-    auto next_alignment = static_cast<uint8_t>(
+    auto next_alignment = static_cast<uint16_t>(
         i == col_ids_.size() - 1 ? sizeof(uint64_t)
-                                 : std::min(attr_sizes[i + 1], static_cast<AttrType>(sizeof(uint64_t))));
+                                 : std::min(attr_sizes[i + 1], static_cast<uint16_t>(sizeof(uint64_t))));
     size_ = StorageUtil::PadUpToSize(next_alignment, size_ + attr_sizes[i]);
   }
 }
@@ -61,15 +62,14 @@ ProjectedRow *ProjectedRowInitializer::InitializeRow(void *const head) const {
   return result;
 }
 
-ProjectedRowInitializer ProjectedRowInitializer::CreateProjectedRowInitializer(const BlockLayout &layout,
-                                                                               std::vector<col_id_t> col_ids) {
+ProjectedRowInitializer ProjectedRowInitializer::Create(const BlockLayout &layout, std::vector<col_id_t> col_ids) {
   TERRIER_ASSERT(col_ids.size() < layout.NumColumns(),
                  "ProjectedRow should have fewer columns than the table (can't read version vector)");
   // Sort the projection list for optimal space utilization and delta application performance
   // If the col ids are valid ones laid out by BlockLayout, ascending order of id guarantees
   // descending order in attribute size.
   std::sort(col_ids.begin(), col_ids.end(), std::less<>());
-  std::vector<uint8_t> attr_sizes;
+  std::vector<uint16_t> attr_sizes;
   attr_sizes.reserve(col_ids.size());
   for (auto const &col_id : col_ids) {
     attr_sizes.emplace_back(layout.AttrSize(col_id));
@@ -77,9 +77,8 @@ ProjectedRowInitializer ProjectedRowInitializer::CreateProjectedRowInitializer(c
   return ProjectedRowInitializer(attr_sizes, std::move(col_ids));
 }
 
-template <typename AttrType>
-ProjectedRowInitializer ProjectedRowInitializer::CreateProjectedRowInitializerForIndexes(
-    std::vector<AttrType> real_attr_sizes, const std::vector<uint16_t> &pr_offsets) {
+ProjectedRowInitializer ProjectedRowInitializer::Create(std::vector<uint16_t> real_attr_sizes,
+                                                        const std::vector<uint16_t> &pr_offsets) {
   std::sort(real_attr_sizes.begin(), real_attr_sizes.end(), std::greater<>());
   std::vector<col_id_t> col_ids;
   col_ids.reserve(pr_offsets.size());
@@ -89,9 +88,9 @@ ProjectedRowInitializer ProjectedRowInitializer::CreateProjectedRowInitializerFo
   return ProjectedRowInitializer(real_attr_sizes, col_ids);
 }
 
-template ProjectedRowInitializer ProjectedRowInitializer::CreateProjectedRowInitializerForIndexes(
-    std::vector<uint8_t> attr_sizes, const std::vector<uint16_t> &column_ids);
-template ProjectedRowInitializer ProjectedRowInitializer::CreateProjectedRowInitializerForIndexes(
-    std::vector<uint16_t> attr_sizes, const std::vector<uint16_t> &column_ids);
+ProjectedRowInitializer ProjectedRowInitializer::Create(const std::vector<uint16_t> &real_attr_sizes,
+                                                        const std::vector<col_id_t> &col_ids) {
+  return ProjectedRowInitializer(real_attr_sizes, col_ids);
+}
 
 }  // namespace terrier::storage

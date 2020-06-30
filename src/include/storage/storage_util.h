@@ -1,17 +1,15 @@
 #pragma once
-#include <unordered_map>
+
+#include <string>
 #include <utility>
 #include <vector>
+
 #include "common/macros.h"
 #include "common/strong_typedef.h"
-#include "storage/block_layout.h"
 #include "storage/storage_defs.h"
 
-namespace terrier::catalog {
-class Schema;
-}
-
 namespace terrier::storage {
+class BlockLayout;
 class ProjectedRow;
 class TupleAccessStrategy;
 class UndoRecord;
@@ -32,7 +30,7 @@ class StorageUtil {
    * @param projection_list_index the projection_list_index to copy to
    */
   template <class RowType>
-  static void CopyWithNullCheck(const byte *from, RowType *to, uint8_t size, uint16_t projection_list_index);
+  static void CopyWithNullCheck(const byte *from, RowType *to, uint16_t size, uint16_t projection_list_index);
 
   /**
    * Copy from pointer location into the tuple slot at given column id. If the pointer location is null,
@@ -101,7 +99,7 @@ class StorageUtil {
     // example, size is 8 (1000), mask is (0111)
     uintptr_t mask = size - 1;
     auto ptr_value = reinterpret_cast<uintptr_t>(ptr);
-    // This is equivalent to (value + (size - 1)) / size.
+    // This is equivalent to (value + (size - 1)) / size * size.
     return reinterpret_cast<byte *>((ptr_value + mask) & (~mask));
   }
 
@@ -117,14 +115,6 @@ class StorageUtil {
   }
 
   /**
-   * Given a schema, returns both a BlockLayout for the storage layer, and a mapping between each column's oid and the
-   * corresponding column id in the storage layer/BlockLayout
-   * @param schema Schema to generate a BlockLayout from. Columns should all have unique oids
-   * @return pair of BlockLayout and a map between col_oid_t and col_id
-   */
-  static std::pair<BlockLayout, ColumnMap> BlockLayoutFromSchema(const catalog::Schema &schema);
-
-  /**
    * Given attribute sizes which will be sorted descending, computes the starting offsets for each of them.
    *
    * e.g. attribute_sizes {1, 2, 2, VARLEN} sorts to {VARLEN, 2, 2, 1}
@@ -135,7 +125,128 @@ class StorageUtil {
    *
    * @return {offset_varlen, offset_8, offset_4, offset_2, offset_1}
    */
-  static std::vector<uint16_t> ComputeBaseAttributeOffsets(const std::vector<uint8_t> &attr_sizes,
+  static std::vector<uint16_t> ComputeBaseAttributeOffsets(const std::vector<uint16_t> &attr_sizes,
                                                            uint16_t num_reserved_columns);
+
+  /**
+   * Computes the index attribute boundaries for a list of col ids. Col ids must be in ascending sorted order
+   * See comment on AttrSizeFromBoundaries for explanation of size boundaries.
+   * The boundries are for the indexes of each col_id, not the col_ids themselves. For
+   * example (given the resulting vector is attr_boundries), if attr_boundries[0] = 2, then columns col_ids[0] and
+   * col_ids[1] have attribute sizes of 16.
+   * @warning col_ids must be in sorted order
+   * @param layout block layout to get attribute size for col id
+   * @param col_ids col ids to generate boundaries for
+   * @param num_cols number of column ids
+   * @param attr_boundaries pointer to array to store attribute boundaries
+   */
+  static void ComputeAttributeSizeBoundaries(const storage::BlockLayout &layout, const col_id_t *col_ids,
+                                             uint16_t num_cols, uint16_t *attr_boundaries);
+
+  /**
+   * @brief Get attribute size for a col index
+   * The boundaries denote the col idx boundaries, such that for a column index k, if boundaries[i] <= k <
+   * boundaries[i+1], then, the size of the column is 16 >> i.
+   * Example: If of the boundaries are [1, 4, 5, 7], and the column index is 3, then the size of the column is 16 >> 1
+   * which is 8
+   * @param boundaries vector attribute size boundries
+   * @param col_idx index of column
+   * @return attribute size of col at index col_idx
+   */
+  static uint8_t AttrSizeFromBoundaries(const std::vector<uint16_t> &boundaries, uint16_t col_idx);
+
+  /**
+   * Return a vector of all the column ids in the layout, excluding columns reserved by the storage layer
+   * for internal use.
+   * @param layout
+   * @return vector of column ids
+   */
+  static std::vector<storage::col_id_t> ProjectionListAllColumns(const storage::BlockLayout &layout);
+
+  /**
+   * Deallocates the value buffers along varlen columns within a block
+   * @param block the block to clean up
+   * @param accessor accessor used to interact with the block
+   */
+  static void DeallocateVarlens(RawBlock *block, const TupleAccessStrategy &accessor);
+
+  /**
+   * Helper method to turn a string into a VarlenEntry
+   * @param str input to be turned into a VarlenEntry
+   * @return varlen entry representing string
+   * @warning checking IsInlined() to see if you need to possibly clean up a buffer
+   */
+  static storage::VarlenEntry CreateVarlen(const std::string &str) {
+    if (str.size() > storage::VarlenEntry::InlineThreshold()) {
+      byte *contents = common::AllocationUtil::AllocateAligned(str.size());
+      std::memcpy(contents, str.data(), str.size());
+      return storage::VarlenEntry::Create(contents, static_cast<uint32_t>(str.size()), true);
+    }
+    return storage::VarlenEntry::CreateInline(reinterpret_cast<const byte *>(str.data()),
+                                              static_cast<uint32_t>(str.size()));
+  }
+
+  /**
+   * Helper method to serialize a vector of strings into a VarlenEntry
+   * @param vec input whose elements are to be serialized into a VarlenEntry
+   * @return varlen entry representing this data vector
+   * @warning checking IsInlined() to see if you need to possibly clean up a buffer
+   * @warning the length of the data vector is not serialized
+   */
+  static storage::VarlenEntry CreateVarlen(const std::vector<std::string> &vec) {
+    // determine total size
+    size_t total_size = sizeof(size_t);
+    for (auto &elem : vec) {
+      total_size += sizeof(size_t);
+      total_size += elem.length();
+    }
+
+    byte *contents = common::AllocationUtil::AllocateAligned(total_size);
+    byte *head = contents;
+    *reinterpret_cast<size_t *>(head) = vec.size();
+    head += sizeof(size_t);
+
+    // serialize with length followed by string
+    for (auto &elem : vec) {
+      *(reinterpret_cast<size_t *>(head)) = elem.length();
+      head += sizeof(size_t);
+      std::memcpy(head, elem.data(), elem.length());
+      head += elem.length();
+    }
+    if (total_size > storage::VarlenEntry::InlineThreshold()) {
+      return storage::VarlenEntry::Create(contents, static_cast<uint32_t>(total_size), true);
+    }
+
+    auto ret = storage::VarlenEntry::CreateInline(contents, static_cast<uint32_t>(total_size));
+    delete[] contents;
+    return ret;
+  }
+
+  /**
+   * Helper method to serialize a vector of type T into a VarlenEntry
+   * @tparam T type of elements in data vector
+   * @param vec input whose elements are to be serialized into a VarlenEntry
+   * @return varlen entry representing this data vector
+   * @warning checking IsInlined() to see if you need to possibly clean up a buffer
+   * @warning the length of the data vector is not serialized
+   * @warning be careful if vec consists of pointers
+   */
+  template <typename T>
+  static storage::VarlenEntry CreateVarlen(const std::vector<T> &vec) {
+    // determine total size
+    size_t total_size = sizeof(T) * vec.size() + sizeof(size_t);
+
+    // can be optimized to avoid this allocation in the inlined case if it becomes an issue
+    byte *contents = common::AllocationUtil::AllocateAligned(total_size);
+    *reinterpret_cast<size_t *>(contents) = vec.size();
+    byte *payload = contents + sizeof(size_t);
+    std::memcpy(payload, vec.data(), sizeof(T) * vec.size());
+    if (total_size > storage::VarlenEntry::InlineThreshold()) {
+      return storage::VarlenEntry::Create(contents, static_cast<uint32_t>(total_size), true);
+    }
+    auto ret = storage::VarlenEntry::CreateInline(contents, static_cast<uint32_t>(total_size));
+    delete[] contents;
+    return ret;
+  }
 };
 }  // namespace terrier::storage

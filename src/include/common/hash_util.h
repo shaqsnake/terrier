@@ -3,9 +3,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
+
 #include "common/strong_typedef.h"
 namespace terrier::common {
 
+/**
+ * This is our typedef that we use throughout the entire code to represent a hash value.
+ */
 using hash_t = uint64_t;
 
 /**
@@ -13,7 +17,7 @@ using hash_t = uint64_t;
  */
 class HashUtil {
  private:
-  static const hash_t prime_factor = 10000019;
+  static const hash_t PRIME_FACTOR = 10000019;
 
  public:
   // Static utility class
@@ -71,7 +75,7 @@ class HashUtil {
    * @return sum of two hashes
    */
   static hash_t SumHashes(const hash_t l, const hash_t r) {
-    return (l % prime_factor + r % prime_factor) % prime_factor;
+    return (l % PRIME_FACTOR + r % PRIME_FACTOR) % PRIME_FACTOR;
   }
 
   /**
@@ -84,6 +88,33 @@ class HashUtil {
   static hash_t Hash(const T &obj) {
     return HashBytes(reinterpret_cast<const byte *>(&obj), sizeof(T));
   }
+
+  /**
+   * Special case Hash method for strings. If you use the above version (const T &obj),
+   * you will hash the address of the string's data, which is not what you want.
+   * @param str the string to be hashed
+   * @return hash of the string
+   */
+  static hash_t Hash(const std::string &str) {
+    return HashBytes(reinterpret_cast<const byte *>(str.data()), str.size());
+  }
+
+  /**
+   * Special case Hash method for string_vals. If you use the above version (const T &obj),
+   * you will hash the address of the string's data, which is not what you want.
+   * @param str the string to be hashed
+   * @return hash of the string
+   */
+  static hash_t Hash(const std::string_view str) {
+    return HashBytes(reinterpret_cast<const byte *>(str.data()), str.size());
+  }
+
+  /**
+   * Special case Hash method for string literals.
+   * @param str the string to be hashed
+   * @return hash of the string
+   */
+  static hash_t Hash(const char *str) { return Hash(std::string_view(str)); }
 };
 
 }  // namespace terrier::common

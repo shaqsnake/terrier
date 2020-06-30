@@ -4,13 +4,15 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "catalog/catalog_defs.h"
 #include "parser/expression/abstract_expression.h"
 #include "type/type_id.h"
 
 namespace terrier::parser {
 
 /**
- * Represents a logical function expression.
+ * FunctionExpression represents a function invocation (except for CAST(), which is a TypeCastExpression).
  */
 class FunctionExpression : public AbstractExpression {
  public:
@@ -21,16 +23,32 @@ class FunctionExpression : public AbstractExpression {
    * @param children children arguments for the function
    */
   FunctionExpression(std::string &&func_name, const type::TypeId return_value_type,
-                     std::vector<std::shared_ptr<AbstractExpression>> &&children)
+                     std::vector<std::unique_ptr<AbstractExpression>> &&children)
       : AbstractExpression(ExpressionType::FUNCTION, return_value_type, std::move(children)),
         func_name_(std::move(func_name)) {}
 
-  /**
-   * Default constructor for deserialization
-   */
+  /** Default constructor for deserialization. */
   FunctionExpression() = default;
 
-  std::shared_ptr<AbstractExpression> Copy() const override { return std::make_shared<FunctionExpression>(*this); }
+  /**
+   * Copies this FunctionExpression
+   * @returns copy of this
+   */
+  std::unique_ptr<AbstractExpression> Copy() const override;
+  /**
+   * Creates a copy of the current AbstractExpression with new children implanted.
+   * The children should not be owned by any other AbstractExpression.
+   * @param children New children to be owned by the copy
+   * @returns copy of this with new children
+   */
+  std::unique_ptr<AbstractExpression> CopyWithChildren(
+      std::vector<std::unique_ptr<AbstractExpression>> &&children) const override;
+
+  common::hash_t Hash() const override {
+    common::hash_t hash = AbstractExpression::Hash();
+    hash = common::HashUtil::CombineHashes(hash, common::HashUtil::Hash(func_name_));
+    return hash;
+  }
 
   bool operator==(const AbstractExpression &rhs) const override {
     if (!AbstractExpression::operator==(rhs)) return false;
@@ -38,46 +56,43 @@ class FunctionExpression : public AbstractExpression {
     return GetFuncName() == other.GetFuncName();
   }
 
-  /**
-   * @return function name
-   */
+  /** @return function name */
   const std::string &GetFuncName() const { return func_name_; }
 
-  /**
-   * @return expression serialized to json
-   */
-  nlohmann::json ToJson() const override {
-    nlohmann::json j = AbstractExpression::ToJson();
-    j["func_name"] = func_name_;
-    return j;
-  }
+  void DeriveExpressionName() override { SetExpressionName(GetFuncName()); }
+
+  void Accept(common::ManagedPointer<binder::SqlNodeVisitor> v) override { v->Visit(common::ManagedPointer(this)); }
+
+  /** @return expression serialized to json */
+  nlohmann::json ToJson() const override;
 
   /**
    * @param j json to deserialize
    */
-  void FromJson(const nlohmann::json &j) override {
-    AbstractExpression::FromJson(j);
-    func_name_ = j.at("func_name").get<std::string>();
-  }
+  std::vector<std::unique_ptr<AbstractExpression>> FromJson(const nlohmann::json &j) override;
+
+  /**
+   * Sets the proc oid of this node
+   * @param proc_oid proc oid to set this node to point to
+   */
+  void SetProcOid(catalog::proc_oid_t proc_oid) { proc_oid_ = proc_oid; }
+
+  /**
+   * Gets the bound proc_oid of the function
+   * @return proc_oid of the function bound to this expression
+   */
+  catalog::proc_oid_t GetProcOid() const { return proc_oid_; }
 
  private:
+  /** Name of function to be invoked. */
   std::string func_name_;
 
-  // TODO(Tianyu): Why the hell are these things in the parser nodes anyway? Parsers are dumb. They don't know shit.
-  // TODO(WAN): doesn't appear in postgres parser code
-  // std::vector<TypeId> func_arg_types_;
+  // To quote Tianyu, "Parsers are dumb. They don't know shit."
+  // We should keep it that way, resist adding codegen hacks here.
 
-  // TODO(WAN): until codegen is in.
-  // Does it really make sense to store BuiltInFuncType AND name though?
-  // Old code already had map name->func
-  // std::shared_ptr<codegen::CodeContext> func_context_;
-  // function::BuiltInFuncType func_;
-
-  // TODO(WAN): will user defined functions need special treatment?
-  // If so, wouldn't it make more sense for them to have their own class?
-  // bool is_udf_;
+  catalog::proc_oid_t proc_oid_;
 };
 
-DEFINE_JSON_DECLARATIONS(FunctionExpression);
+DEFINE_JSON_HEADER_DECLARATIONS(FunctionExpression);
 
 }  // namespace terrier::parser

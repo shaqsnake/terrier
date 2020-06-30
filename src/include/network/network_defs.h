@@ -1,34 +1,20 @@
 #pragma once
 
-#include <unistd.h>
-#include <bitset>
-#include <climits>
-#include <cstdint>
-#include <functional>
-#include <limits>
-#include <map>
-#include <memory>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-#include "tbb/concurrent_unordered_map.h"
-#include "tbb/concurrent_unordered_set.h"
-#include "tbb/concurrent_vector.h"
+#include "common/strong_typedef.h"
 
-#include "common/macros.h"
-#include "loggers/main_logger.h"
-#include "parser/pg_trigger.h"
-#include "type/type_id.h"
+namespace terrier::trafficcop {
+class TrafficCop;
+}
 
 namespace terrier::network {
+class PostgresPacketWriter;
+class ReadBuffer;
 
-// For epoch
-// static const size_t EPOCH_LENGTH = 40;
-
-// For threads
-#define CONNECTION_THREAD_COUNT 1
+// This is to be stashed in a ConnectionContext as a unique identifier. This is really just the socket, but we don't
+// want anyone using it to directly access the socket downstream
+STRONG_TYPEDEF_HEADER(connection_id_t, uint16_t);
 
 // Number of seconds to timeout on a client read
 #define READ_TIMEOUT (20 * 60)
@@ -52,12 +38,7 @@ using uchar = unsigned char;
 /* type for buffer of bytes */
 using ByteBuf = std::vector<uchar>;
 
-using CallbackFunc = std::function<void(void)>;
-
-enum class NetworkProtocolType {
-  POSTGRES_JDBC,
-  POSTGRES_PSQL,
-};
+using NetworkCallback = void (*)(void *);
 
 //===--------------------------------------------------------------------===//
 // Network Message Types
@@ -69,96 +50,96 @@ enum class NetworkMessageType : unsigned char {
   NULL_COMMAND = '0',
 
   // Messages that don't have headers (like Startup message)
-  NO_HEADER,
+  NO_HEADER = 255,
+
+  ////////////////////////////
+  // Postgres message types //
+  ////////////////////////////
 
   // Responses
-  PARSE_COMPLETE = '1',
-  BIND_COMPLETE = '2',
-  CLOSE_COMPLETE = '3',
-  COMMAND_COMPLETE = 'C',
-  PARAMETER_STATUS = 'S',
-  AUTHENTICATION_REQUEST = 'R',
-  ERROR_RESPONSE = 'E',
-  EMPTY_QUERY_RESPONSE = 'I',
-  NO_DATA_RESPONSE = 'n',
-  READY_FOR_QUERY = 'Z',
-  ROW_DESCRIPTION = 'T',
-  DATA_ROW = 'D',
-  // Errors
-  HUMAN_READABLE_ERROR = 'M',
-  SQLSTATE_CODE_ERROR = 'C',
+  PG_PARSE_COMPLETE = '1',
+  PG_BIND_COMPLETE = '2',
+  PG_CLOSE_COMPLETE = '3',
+  PG_COMMAND_COMPLETE = 'C',
+  PG_PARAMETER_STATUS = 'S',
+  PG_AUTHENTICATION_REQUEST = 'R',
+  PG_NOTICE_RESPONSE = 'N',
+  PG_ERROR_RESPONSE = 'E',
+  PG_EMPTY_QUERY_RESPONSE = 'I',
+  PG_NO_DATA_RESPONSE = 'n',
+  PG_READY_FOR_QUERY = 'Z',
+  PG_PARAMETER_DESCRIPTION = 't',
+  PG_ROW_DESCRIPTION = 'T',
+  PG_DATA_ROW = 'D',
   // Commands
-  EXECUTE_COMMAND = 'E',
-  SYNC_COMMAND = 'S',
-  TERMINATE_COMMAND = 'X',
-  DESCRIBE_COMMAND = 'D',
-  BIND_COMMAND = 'B',
-  PARSE_COMMAND = 'P',
-  SIMPLE_QUERY_COMMAND = 'Q',
-  CLOSE_COMMAND = 'C',
-  // SSL willingness
-  SSL_YES = 'S',
-  SSL_NO = 'N',
+  PG_EXECUTE_COMMAND = 'E',
+  PG_SYNC_COMMAND = 'S',
+  PG_TERMINATE_COMMAND = 'X',
+  PG_DESCRIBE_COMMAND = 'D',
+  PG_BIND_COMMAND = 'B',
+  PG_PARSE_COMMAND = 'P',
+  PG_SIMPLE_QUERY_COMMAND = 'Q',
+  PG_CLOSE_COMMAND = 'C',
+
+  ////////////////////////
+  // ITP message types  //
+  ////////////////////////
+  ITP_REPLICATION_COMMAND = 'r',
+  ITP_STOP_REPLICATION_COMMAND = 'e',
+  ITP_COMMAND_COMPLETE = 'c',
 };
 
-//===--------------------------------------------------------------------===//
-// Describe Message Types
-//===--------------------------------------------------------------------===//
+enum class DescribeCommandObjectType : unsigned char { PORTAL = 'P', STATEMENT = 'S' };
 
-enum class ExtendedQueryObjectType : unsigned char { PORTAL = 'P', PREPARED = 'S' };
-
-//===--------------------------------------------------------------------===//
-// Query Types
-//===--------------------------------------------------------------------===//
-
-enum class QueryType {
-  QUERY_BEGIN = 0,         // begin query
-  QUERY_COMMIT = 1,        // commit query
-  QUERY_ROLLBACK = 2,      // rollback query
-  QUERY_CREATE_TABLE = 3,  // create query
-  QUERY_CREATE_DB = 4,
-  QUERY_CREATE_INDEX = 5,
-  QUERY_DROP = 6,     // other queries
-  QUERY_INSERT = 7,   // insert query
-  QUERY_PREPARE = 8,  // prepare query
-  QUERY_EXECUTE = 9,  // execute query
-  QUERY_UPDATE = 10,
-  QUERY_DELETE = 11,
-  QUERY_RENAME = 12,
-  QUERY_ALTER = 13,
-  QUERY_COPY = 14,
-  QUERY_ANALYZE = 15,
-  QUERY_SET = 16,   // set query
-  QUERY_SHOW = 17,  // show query
-  QUERY_SELECT = 18,
-  QUERY_OTHER = 19,
-  QUERY_INVALID = 20,
-  QUERY_CREATE_TRIGGER = 21,
-  QUERY_CREATE_SCHEMA = 22,
-  QUERY_CREATE_VIEW = 23,
-  QUERY_EXPLAIN = 24
-};
-
-//===--------------------------------------------------------------------===//
-// Result Types
-//===--------------------------------------------------------------------===//
-
-enum class ResultType {
-  INVALID = INVALID_TYPE_ID,  // invalid result type
-  SUCCESS = 1,
-  FAILURE = 2,
-  ABORTED = 3,  // aborted
-  NOOP = 4,     // no op
-  UNKNOWN = 5,
-  QUEUING = 6,
-  TO_ABORT = 7,
+// The TrafficCop logic relies on very specific ordering of these values. Reorder with care.
+enum class QueryType : uint8_t {
+  // Transaction statements
+  QUERY_BEGIN,
+  QUERY_COMMIT,
+  QUERY_ROLLBACK,
+  // DML
+  QUERY_SELECT,
+  QUERY_INSERT,
+  QUERY_UPDATE,
+  QUERY_DELETE,
+  // DDL
+  QUERY_CREATE_TABLE,
+  QUERY_CREATE_DB,
+  QUERY_CREATE_INDEX,
+  QUERY_CREATE_TRIGGER,
+  QUERY_CREATE_SCHEMA,
+  QUERY_CREATE_VIEW,
+  QUERY_DROP_TABLE,
+  QUERY_DROP_DB,
+  QUERY_DROP_INDEX,
+  QUERY_DROP_TRIGGER,
+  QUERY_DROP_SCHEMA,
+  QUERY_DROP_VIEW,
+  // end of what we support in the traffic cop right now
+  QUERY_RENAME,
+  QUERY_ALTER,
+  // Prepared statement stuff
+  QUERY_DROP_PREPARED_STATEMENT,
+  QUERY_PREPARE,
+  QUERY_EXECUTE,
+  // Misc
+  QUERY_COPY,
+  QUERY_ANALYZE,
+  QUERY_SET,
+  QUERY_SHOW,
+  QUERY_OTHER,
+  QUERY_EXPLAIN,
+  QUERY_INVALID
 };
 
 enum class NetworkTransactionStateType : unsigned char {
   INVALID = static_cast<unsigned char>(INVALID_TYPE_ID),
-  IDLE = 'I',
-  BLOCK = 'T',
-  FAIL = 'E',
+  IDLE = 'I',   // Not in a transaction block
+  BLOCK = 'T',  // In a transaction block
+  FAIL = 'E',   // In a failed transaction
 };
+
+// postgres uses 0 for text, 1 for binary, so this is fine
+enum class FieldFormat : bool { text = false, binary = true };
 
 }  // namespace terrier::network

@@ -1,53 +1,93 @@
-#include <network/terrier_server.h>
-#include <fstream>
-#include <iostream>
+#include <gflags/gflags.h>
+
+#include <csignal>
 #include <memory>
-#include <vector>
-#include "bwtree/bwtree.h"
-#include "common/allocator.h"
-#include "common/stat_registry.h"
-#include "common/strong_typedef.h"
-#include "loggers/index_logger.h"
-#include "loggers/main_logger.h"
-#include "loggers/network_logger.h"
-#include "loggers/parser_logger.h"
-#include "loggers/storage_logger.h"
-#include "loggers/transaction_logger.h"
-#include "loggers/type_logger.h"
-#include "storage/data_table.h"
-#include "storage/record_buffer.h"
-#include "storage/storage_defs.h"
-#include "transaction/transaction_context.h"
+#include <unordered_map>
+#include <utility>
 
-int main() {
-  // initialize loggers
-  try {
-    init_main_logger();
-    // initialize namespace specific loggers
-    terrier::storage::init_index_logger();
-    terrier::storage::init_storage_logger();
-    terrier::transaction::init_transaction_logger();
-    terrier::parser::init_parser_logger();
-    terrier::network::init_network_logger();
-    // Flush all *registered* loggers using a worker thread.
-    // Registered loggers must be thread safe for this to work correctly
-    spdlog::flush_every(std::chrono::seconds(DEBUG_LOG_FLUSH_INTERVAL));
-  } catch (const spdlog::spdlog_ex &ex) {
-    std::cout << "debug log init failed " << ex.what() << std::endl;  // NOLINT
-    return 1;
+#include "common/managed_pointer.h"
+#include "loggers/loggers_util.h"
+#include "main/db_main.h"
+#include "settings/settings_manager.h"
+
+/**
+ * Need a global pointer to access from SignalHandler, unfortunately. Do not remove from this anonymous namespace since
+ * the pointer is meant only for the signal handler. If you think you need a global pointer to db_main somewhere else in
+ * the system, you're probably doing something wrong.
+ */
+namespace {
+terrier::common::ManagedPointer<terrier::DBMain> db_main_handler_ptr = nullptr;
+}
+
+/**
+ * The signal handler to be invoked for SIGINT and SIGTERM
+ * @param sig_num portable signal number passed to the handler by the kernel
+ */
+void SignalHandler(int32_t sig_num) {
+  if ((sig_num == SIGINT || sig_num == SIGTERM) && db_main_handler_ptr != nullptr) {
+    db_main_handler_ptr->ForceShutdown();
   }
-  // log init now complete
-  LOG_TRACE("Logger initialization complete");
+}
 
-  // initialize stat registry
-  auto main_stat_reg = std::make_shared<terrier::common::StatisticsRegistry>();
+/**
+ * Register SignalHandler for SIGINT and SIGTERM
+ * @return 0 if successful, otherwise errno
+ */
+int32_t RegisterSignalHandler() {
+  // Initialize a signal handler to call SignalHandler()
+  struct sigaction sa;  // NOLINT
+  sa.sa_handler = &SignalHandler;
+  sa.sa_flags = SA_RESTART;
 
-  LOG_INFO("Initialization complete");
+  sigfillset(&sa.sa_mask);
 
-  terrier::network::TerrierServer terrier_server;
-  terrier_server.SetupServer().ServerLoop();
+  // Terminal interrupt signal (usually from ^c, portable number is 2)
+  if (sigaction(SIGINT, &sa, nullptr) == -1) {
+    return errno;
+  }
 
-  // shutdown loggers
-  spdlog::shutdown();
-  main_stat_reg->Shutdown(false);
+  // Terminate signal from administrator (portable number is 15)
+  if (sigaction(SIGTERM, &sa, nullptr) == -1) {
+    return errno;
+  }
+
+  return 0;
+}
+
+int main(int argc, char *argv[]) {
+  // Register signal handler so we can kill the server once it's running
+  const auto register_result = RegisterSignalHandler();
+  if (register_result != 0) {
+    return register_result;
+  }
+
+  // Parse Setting Values
+  ::google::SetUsageMessage("Usage Info: \n");
+  ::google::ParseCommandLineFlags(&argc, &argv, true);
+
+  // Initialize debug loggers
+  terrier::LoggersUtil::Initialize();
+
+  // Generate Settings Manager map
+  std::unordered_map<terrier::settings::Param, terrier::settings::ParamInfo> param_map;
+  terrier::settings::SettingsManager::ConstructParamMap(param_map);
+
+  auto db_main = terrier::DBMain::Builder()
+                     .SetSettingsParameterMap(std::move(param_map))
+                     .SetUseSettingsManager(true)
+                     .SetUseGC(true)
+                     .SetUseCatalog(true)
+                     .SetUseGCThread(true)
+                     .SetUseStatsStorage(true)
+                     .SetUseExecution(true)
+                     .SetUseTrafficCop(true)
+                     .SetUseNetwork(true)
+                     .Build();
+
+  db_main_handler_ptr = db_main.get();
+
+  db_main->Run();
+
+  terrier::LoggersUtil::ShutDown();
+  return 0;
 }

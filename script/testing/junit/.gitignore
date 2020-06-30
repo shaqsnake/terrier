@@ -1,0 +1,2 @@
+# keep the jar files
+!lib/*.jar

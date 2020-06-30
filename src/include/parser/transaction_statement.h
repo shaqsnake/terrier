@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common/sql_node_visitor.h"
+#include "binder/sql_node_visitor.h"
 #include "parser/sql_statement.h"
 
 namespace terrier::parser {
@@ -25,7 +25,7 @@ class TransactionStatement : public SQLStatement {
    */
   explicit TransactionStatement(CommandType type) : SQLStatement(StatementType::TRANSACTION), type_(type) {}
 
-  void Accept(SqlNodeVisitor *v) override { v->Visit(this); }
+  void Accept(common::ManagedPointer<binder::SqlNodeVisitor> v) override { v->Visit(common::ManagedPointer(this)); }
 
   /**
    * @return transaction command

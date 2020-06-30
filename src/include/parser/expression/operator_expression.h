@@ -4,13 +4,10 @@
 #include <utility>
 #include <vector>
 #include "parser/expression/abstract_expression.h"
-#include "parser/expression_defs.h"
-#include "type/transient_value.h"
 
 namespace terrier::parser {
-
 /**
- * Represents an operator.
+ * OperatorExpression represents a generic N-ary operator.
  */
 class OperatorExpression : public AbstractExpression {
  public:
@@ -18,33 +15,35 @@ class OperatorExpression : public AbstractExpression {
    * Instantiates a new operator.
    * @param expression_type type of operator
    * @param return_value_type return type of the operator
-   * @param children vector containing arguments to the operator left to right
+   * @param children vector containing arguments to the operator, left to right
    */
   OperatorExpression(const ExpressionType expression_type, const type::TypeId return_value_type,
-                     std::vector<std::shared_ptr<AbstractExpression>> &&children)
+                     std::vector<std::unique_ptr<AbstractExpression>> &&children)
       : AbstractExpression(expression_type, return_value_type, std::move(children)) {}
 
-  /**
-   * Default constructor for deserialization
-   */
+  /** Default constructor for deserialization. */
   OperatorExpression() = default;
 
-  std::shared_ptr<AbstractExpression> Copy() const override { return std::make_shared<OperatorExpression>(*this); }
+  /**
+   * Copies this OperatorExpression
+   * @returns copy of this
+   */
+  std::unique_ptr<AbstractExpression> Copy() const override;
 
   /**
-   * @return expression serialized to json
+   * Creates a copy of the current AbstractExpression with new children implanted.
+   * The children should not be owned by any other AbstractExpression.
+   * @param children New children to be owned by the copy
+   * @returns copy of this
    */
-  nlohmann::json ToJson() const override {
-    nlohmann::json j = AbstractExpression::ToJson();
-    return j;
-  }
+  std::unique_ptr<AbstractExpression> CopyWithChildren(
+      std::vector<std::unique_ptr<AbstractExpression>> &&children) const override;
 
-  /**
-   * @param j json to deserialize
-   */
-  void FromJson(const nlohmann::json &j) override { AbstractExpression::FromJson(j); }
+  void DeriveReturnValueType() override;
+
+  void Accept(common::ManagedPointer<binder::SqlNodeVisitor> v) override { v->Visit(common::ManagedPointer(this)); }
 };
 
-DEFINE_JSON_DECLARATIONS(OperatorExpression);
+DEFINE_JSON_HEADER_DECLARATIONS(OperatorExpression);
 
 }  // namespace terrier::parser

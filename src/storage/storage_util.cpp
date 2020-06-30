@@ -1,16 +1,18 @@
 #include "storage/storage_util.h"
+
 #include <cstring>
 #include <unordered_map>
-#include <utility>
 #include <vector>
+
 #include "catalog/schema.h"
 #include "storage/projected_columns.h"
 #include "storage/tuple_access_strategy.h"
 #include "storage/undo_record.h"
+
 namespace terrier::storage {
 
 template <class RowType>
-void StorageUtil::CopyWithNullCheck(const byte *const from, RowType *const to, const uint8_t size,
+void StorageUtil::CopyWithNullCheck(const byte *const from, RowType *const to, const uint16_t size,
                                     const uint16_t projection_list_index) {
   if (from == nullptr)
     to->SetNull(projection_list_index);
@@ -18,9 +20,9 @@ void StorageUtil::CopyWithNullCheck(const byte *const from, RowType *const to, c
     std::memcpy(to->AccessForceNotNull(projection_list_index), from, size);
 }
 
-template void StorageUtil::CopyWithNullCheck<ProjectedRow>(const byte *, ProjectedRow *, uint8_t, uint16_t);
+template void StorageUtil::CopyWithNullCheck<ProjectedRow>(const byte *, ProjectedRow *, uint16_t, uint16_t);
 template void StorageUtil::CopyWithNullCheck<ProjectedColumns::RowView>(const byte *, ProjectedColumns::RowView *,
-                                                                        uint8_t, uint16_t);
+                                                                        uint16_t, uint16_t);
 
 void StorageUtil::CopyWithNullCheck(const byte *const from, const TupleAccessStrategy &accessor, const TupleSlot to,
                                     const col_id_t col_id) {
@@ -98,7 +100,7 @@ uint32_t StorageUtil::PadUpToSize(const uint8_t word_size, const uint32_t offset
   return (offset + mask) & (~mask);
 }
 
-std::vector<uint16_t> StorageUtil::ComputeBaseAttributeOffsets(const std::vector<uint8_t> &attr_sizes,
+std::vector<uint16_t> StorageUtil::ComputeBaseAttributeOffsets(const std::vector<uint16_t> &attr_sizes,
                                                                uint16_t num_reserved_columns) {
   // First compute {count_varlen, count_8, count_4, count_2, count_1}
   // Then {offset_varlen, offset_8, offset_4, offset_2, offset_1} is the inclusive scan of the counts
@@ -139,6 +141,70 @@ std::vector<uint16_t> StorageUtil::ComputeBaseAttributeOffsets(const std::vector
     offsets[i] = static_cast<uint16_t>(offsets[i] + offsets[i - 1]);
   }
   return offsets;
+}
+
+uint8_t StorageUtil::AttrSizeFromBoundaries(const std::vector<uint16_t> &boundaries, const uint16_t col_idx) {
+  TERRIER_ASSERT(boundaries.size() == NUM_ATTR_BOUNDARIES,
+                 "Boudaries vector size should equal to number of boundaries");
+  // Since the columns are sorted (DESC) by size, the boundaries denote the index boundaries between columns of size
+  // 16|8|4|2|1. Iterate through boundaries until we find a boundary greater than the index.
+  uint8_t shift;
+  for (shift = 0; shift < NUM_ATTR_BOUNDARIES; shift++) {
+    if (col_idx < boundaries[shift]) break;
+  }
+  TERRIER_ASSERT(shift <= NUM_ATTR_BOUNDARIES, "Out-of-bounds attribute size");
+  TERRIER_ASSERT(shift >= 0, "Out-of-bounds attribute size");
+  // The amount of boundaries we had to cross is how much we shift 16 (the max size) by
+  return static_cast<uint8_t>(16U >> shift);
+}
+
+void StorageUtil::ComputeAttributeSizeBoundaries(const terrier::storage::BlockLayout &layout, const col_id_t *col_ids,
+                                                 const uint16_t num_cols, uint16_t *attr_boundaries) {
+  int attr_size_index = 0;
+
+  // Col ids ASC sorted order is also attribute size DESC sorted order
+  for (uint16_t i = 0; i < num_cols; i++) {
+    TERRIER_ASSERT(i < (1 << 15), "Out-of-bounds index");
+
+    int attr_size = layout.AttrSize(col_ids[i]);
+    TERRIER_ASSERT(attr_size <= (16 >> attr_size_index), "Out-of-order columns");
+    TERRIER_ASSERT(attr_size <= 16 && attr_size > 0, "Unexpected attribute size");
+    // When we see a size that is less than our current boundary size, denote the end of the boundary
+    while (attr_size < (16 >> attr_size_index)) {
+      if (attr_size_index < (NUM_ATTR_BOUNDARIES - 1))
+        attr_boundaries[attr_size_index + 1] = attr_boundaries[attr_size_index];
+      attr_size_index++;
+    }
+    TERRIER_ASSERT(attr_size == (16 >> attr_size_index), "Non-power of two attribute size");
+    // At this point, this column's size is the same as the current boundary size, so we increment the number of cols
+    // for this boundary
+    if (attr_size_index < NUM_ATTR_BOUNDARIES) attr_boundaries[attr_size_index]++;
+    TERRIER_ASSERT(attr_size_index == NUM_ATTR_BOUNDARIES || attr_boundaries[attr_size_index] == i + 1,
+                   "Inconsistent state on attribute bounds");
+  }
+}
+
+std::vector<storage::col_id_t> StorageUtil::ProjectionListAllColumns(const storage::BlockLayout &layout) {
+  std::vector<storage::col_id_t> col_ids(layout.NumColumns() - NUM_RESERVED_COLUMNS);
+  // Add all of the column ids from the layout to the projection list
+  // 0 is version vector so we skip it
+  for (uint16_t col = NUM_RESERVED_COLUMNS; col < layout.NumColumns(); col++) {
+    col_ids[col - NUM_RESERVED_COLUMNS] = storage::col_id_t(col);
+  }
+  return col_ids;
+}
+
+void StorageUtil::DeallocateVarlens(RawBlock *block, const TupleAccessStrategy &accessor) {
+  const BlockLayout &layout = accessor.GetBlockLayout();
+  for (col_id_t col : layout.Varlens()) {
+    for (uint32_t offset = 0; offset < layout.NumSlots(); offset++) {
+      TupleSlot slot(block, offset);
+      if (!accessor.Allocated(slot)) continue;
+      auto *entry = reinterpret_cast<VarlenEntry *>(accessor.AccessWithNullCheck(slot, col));
+      // If entry is null here, the varlen entry is a null SQL value.
+      if (entry != nullptr && entry->NeedReclaim()) delete[] entry->Content();
+    }
+  }
 }
 
 }  // namespace terrier::storage

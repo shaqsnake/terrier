@@ -1,8 +1,11 @@
 #pragma once
+
+#include <cstring>
 #include <list>
 #include <unordered_map>
 #include <vector>
-#include "common/performance_counter.h"
+
+#include "common/managed_pointer.h"
 #include "storage/projected_columns.h"
 #include "storage/storage_defs.h"
 #include "storage/tuple_access_strategy.h"
@@ -15,16 +18,13 @@ class TransactionManager;
 
 namespace terrier::storage {
 
-// clang-format off
-#define DataTableCounterMembers(f) \
-  f(uint64_t, NumSelect) \
-  f(uint64_t, NumUpdate) \
-  f(uint64_t, NumInsert) \
-  f(uint64_t, NumDelete) \
-  f(uint64_t, NumNewBlock)
-// clang-format on
-DEFINE_PERFORMANCE_CLASS(DataTableCounter, DataTableCounterMembers)
-#undef DataTableCounterMembers
+namespace index {
+class Index;
+template <typename KeyType>
+class BwTreeIndex;
+template <typename KeyType>
+class HashIndex;
+}  // namespace index
 
 /**
  * A DataTable is a thin layer above blocks that handles visibility, schemas, and maintenance of versions for a
@@ -34,7 +34,7 @@ DEFINE_PERFORMANCE_CLASS(DataTableCounter, DataTableCounterMembers)
 class DataTable {
  public:
   /**
-   * Iterator for all the slots, claimed or otherwise, in the data table. This is useful for sequential scans.
+   * Iterator for all the slots, claimed or otherwise, in the data table. This is useful for sequential scans
    */
   class SlotIterator {
    public:
@@ -58,7 +58,7 @@ class DataTable {
      * post-fix increment.
      * @return copy of the iterator equal to this before increment
      */
-    const SlotIterator operator++(int) {
+    SlotIterator operator++(int) {
       SlotIterator copy = *this;
       operator++();
       return copy;
@@ -105,19 +105,12 @@ class DataTable {
    * @param layout the initial layout of this DataTable. First 2 columns must be 8 bytes.
    * @param layout_version the layout version of this DataTable
    */
-  DataTable(BlockStore *store, const BlockLayout &layout, layout_version_t layout_version);
+  DataTable(common::ManagedPointer<BlockStore> store, const BlockLayout &layout, layout_version_t layout_version);
 
   /**
    * Destructs a DataTable, frees all its blocks and any potential varlen entries.
    */
   ~DataTable();
-
-  // TODO(Matt): I think the concept of a DataTable oid is going away once SqlTable is merged, so this placeholder will
-  // go away
-  /**
-   * @return table oid of this data table
-   */
-  catalog::table_oid_t TableOid() const { return catalog::table_oid_t{0}; }
 
   /**
    * Materializes a single tuple from the given slot, as visible to the transaction given, according to the format
@@ -129,7 +122,8 @@ class DataTable {
    * reference col_id 0
    * @return true if tuple is visible to this txn and ProjectedRow has been populated, false otherwise
    */
-  bool Select(transaction::TransactionContext *txn, TupleSlot slot, ProjectedRow *out_buffer) const;
+  bool Select(common::ManagedPointer<transaction::TransactionContext> txn, TupleSlot slot,
+              ProjectedRow *out_buffer) const;
 
   // TODO(Tianyu): Should this be updated in place or return a new iterator? Does the caller ever want to
   // save a point of scan and come back to it later?
@@ -147,12 +141,13 @@ class DataTable {
    * @param out_buffer output buffer. The object should already contain projection list information. This buffer is
    *                   always cleared of old values.
    */
-  void Scan(transaction::TransactionContext *txn, SlotIterator *start_pos, ProjectedColumns *out_buffer) const;
+  void Scan(common::ManagedPointer<transaction::TransactionContext> txn, SlotIterator *start_pos,
+            ProjectedColumns *out_buffer) const;
 
   /**
    * @return the first tuple slot contained in the data table
    */
-  SlotIterator begin() const {
+  SlotIterator begin() const {  // NOLINT for STL name compability
     common::SpinLatch::ScopedSpinLatch guard(&blocks_latch_);
     return {this, blocks_.begin(), 0};
   }
@@ -164,7 +159,7 @@ class DataTable {
    *
    * @return one past the last tuple slot contained in the data table.
    */
-  SlotIterator end() const;
+  SlotIterator end() const;  // NOLINT for STL name compability
 
   /**
    * Update the tuple according to the redo buffer given, and update the version chain to link to an
@@ -179,7 +174,7 @@ class DataTable {
    * not reference col_id 0
    * @return true if successful, false otherwise
    */
-  bool Update(transaction::TransactionContext *txn, TupleSlot slot, const ProjectedRow &redo);
+  bool Update(common::ManagedPointer<transaction::TransactionContext> txn, TupleSlot slot, const ProjectedRow &redo);
 
   /**
    * Inserts a tuple, as given in the redo, and update the version chain the link to the given
@@ -190,7 +185,7 @@ class DataTable {
    * @return the TupleSlot allocated for this insert, used to identify this tuple's physical location for indexes and
    * such.
    */
-  TupleSlot Insert(transaction::TransactionContext *txn, const ProjectedRow &redo);
+  TupleSlot Insert(common::ManagedPointer<transaction::TransactionContext> txn, const ProjectedRow &redo);
 
   /**
    * Deletes the given TupleSlot, this will call StageDelete on the provided txn to generate the RedoRecord for delete.
@@ -199,21 +194,45 @@ class DataTable {
    * @param slot the slot of the tuple to delete
    * @return true if successful, false otherwise
    */
-  bool Delete(transaction::TransactionContext *txn, TupleSlot slot);
+  bool Delete(common::ManagedPointer<transaction::TransactionContext> txn, TupleSlot slot);
 
   /**
-   * Return a pointer to the performance counter for the data table.
-   * @return pointer to the performance counter
+   * @return read-only view of this DataTable's BlockLayout
    */
-  DataTableCounter *GetDataTableCounter() { return &data_table_counter_; }
+  const BlockLayout &GetBlockLayout() const { return accessor_.GetBlockLayout(); }
+
+  /**
+   * @return a coarse estimation on the number of tuples in this table
+   */
+  uint64_t GetNumTuple() const { return GetBlockLayout().NumSlots() * blocks_.size(); }
+
+  /**
+   * @return Approximate heap usage of the table
+   */
+  size_t EstimateHeapUsage() const {
+    // This is a back-of-the-envelope calculation that could be innacurate. It does not account for the delta chain
+    // elements that are actually owned by TransactionContext
+    return blocks_.size() * common::Constants::BLOCK_SIZE;
+  }
 
  private:
+  // The ArrowSerializer needs access to its blocks.
+  friend class ArrowSerializer;
   // The GarbageCollector needs to modify VersionPtrs when pruning version chains
   friend class GarbageCollector;
   // The TransactionManager needs to modify VersionPtrs when rolling back aborts
   friend class transaction::TransactionManager;
+  // The index wrappers need access to IsVisible and HasConflict
+  friend class index::Index;
+  template <typename KeyType>
+  friend class index::BwTreeIndex;
+  template <typename KeyType>
+  friend class index::HashIndex;
+  // The block compactor elides transactional protection in the gather/compression phase and
+  // needs raw access to the underlying table.
+  friend class BlockCompactor;
 
-  BlockStore *const block_store_;
+  const common::ManagedPointer<BlockStore> block_store_;
   const layout_version_t layout_version_;
   const TupleAccessStrategy accessor_;
 
@@ -226,18 +245,23 @@ class DataTable {
   // We also might need our own implementation because we need to handle GC of an unlinked block, as a sequential scan
   // might be on it
   std::list<RawBlock *> blocks_;
+  // latch used to protect block list
   mutable common::SpinLatch blocks_latch_;
-  // to avoid having to grab a latch every time we insert. Failures are very, very infrequent since these
-  // only happen when blocks are full, thus we can afford to be optimistic
-  std::atomic<RawBlock *> insertion_head_ = nullptr;
-  mutable DataTableCounter data_table_counter_;
+  // latch used to protect insertion_head_
+  mutable common::SpinLatch header_latch_;
+  std::list<RawBlock *>::iterator insertion_head_;
+  // Check if we need to advance the insertion_head_
+  // This function uses header_latch_ to ensure correctness
+  void CheckMoveHead(std::list<RawBlock *>::iterator block);
 
   // A templatized version for select, so that we can use the same code for both row and column access.
   // the method is explicitly instantiated for ProjectedRow and ProjectedColumns::RowView
   template <class RowType>
-  bool SelectIntoBuffer(transaction::TransactionContext *txn, TupleSlot slot, RowType *out_buffer) const;
+  bool SelectIntoBuffer(common::ManagedPointer<transaction::TransactionContext> txn, TupleSlot slot,
+                        RowType *out_buffer) const;
 
-  void InsertInto(transaction::TransactionContext *txn, const ProjectedRow &redo, TupleSlot dest);
+  void InsertInto(common::ManagedPointer<transaction::TransactionContext> txn, const ProjectedRow &redo,
+                  TupleSlot dest);
   // Atomically read out the version pointer value.
   UndoRecord *AtomicallyReadVersionPtr(TupleSlot slot, const TupleAccessStrategy &accessor) const;
 
@@ -246,7 +270,10 @@ class DataTable {
   void AtomicallyWriteVersionPtr(TupleSlot slot, const TupleAccessStrategy &accessor, UndoRecord *desired);
 
   // Checks for Snapshot Isolation conflicts, used by Update
-  bool HasConflict(UndoRecord *version_ptr, const transaction::TransactionContext *txn) const;
+  bool HasConflict(const transaction::TransactionContext &txn, UndoRecord *version_ptr) const;
+
+  // Wrapper around the other HasConflict for indexes to call (they only have tuple slot, not the version pointer)
+  bool HasConflict(const transaction::TransactionContext &txn, TupleSlot slot) const;
 
   // Performs a visibility check on the designated TupleSlot. Note that this does not traverse a version chain, so this
   // information alone is not enough to determine visibility of a tuple to a transaction. This should be used along with
@@ -260,8 +287,16 @@ class DataTable {
                                 UndoRecord *desired);
 
   // Allocates a new block to be used as insertion head.
-  void NewBlock(RawBlock *expected_val);
+  RawBlock *NewBlock();
 
-  void DeallocateVarlensOnShutdown(RawBlock *block);
+  /**
+   * Determine if a Tuple is visible (present and not deleted) to the given transaction. It's effectively Select's logic
+   * (follow a version chain if present) without the materialization. If the logic of Select changes, this should change
+   * with it and vice versa.
+   * @param txn the calling transaction
+   * @param slot the slot of the tuple to check visibility on
+   * @return true if tuple is visible to this txn, false otherwise
+   */
+  bool IsVisible(const transaction::TransactionContext &txn, TupleSlot slot) const;
 };
 }  // namespace terrier::storage

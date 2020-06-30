@@ -1,9 +1,20 @@
 #pragma once
+
 #include <vector>
+
 #include "common/container/bitmap.h"
 #include "common/macros.h"
 #include "common/strong_typedef.h"
 #include "storage/storage_util.h"
+
+namespace terrier::catalog {
+class Catalog;
+class DatabaseCatalog;
+}  // namespace terrier::catalog
+
+namespace terrier::execution::sql {
+class StorageInterface;
+}
 
 namespace terrier::storage {
 // TODO(Tianyu): To be consistent with other places, maybe move val_offset fields in front of col_ids
@@ -37,7 +48,7 @@ class PACKED ProjectedRow {
   MEM_REINTERPRETATION_ONLY(ProjectedRow)
 
   /**
-   * Populates the ProjectedRow's members based on an existing ProjectedRow. The new ProjectRow has the
+   * Populates the ProjectedRow's members based on an existing ProjectedRow. The new ProjectedRow has the
    * same layout as the given one.
    *
    * @param head pointer to the byte buffer to initialize as a ProjectedRow
@@ -131,8 +142,53 @@ class PACKED ProjectedRow {
     return !Bitmap().Test(offset);
   }
 
+  /**
+   * Get a pointer to the value in the column at index @em col_idx
+   * @tparam T The desired data type stored in the vector projection
+   * @tparam Nullable Whether the column is NULLable
+   * @param col_idx The index of the column to read from
+   * @param[out] null null Whether the given column is null
+   * @return The typed value at the current iterator position in the column
+   */
+  template <typename T, bool Nullable>
+  const T *Get(const uint16_t col_idx, bool *const null) const {
+    const auto *result = reinterpret_cast<const T *>(AccessWithNullCheck(col_idx));
+    // NOLINTNEXTLINE: bugprone-suspicious-semicolon: seems like a false positive because of constexpr
+    if constexpr (Nullable) {
+      TERRIER_ASSERT(null != nullptr, "Missing output variable for NULL indicator");
+      if (result == nullptr) {
+        *null = true;
+        return result;
+      }
+      *null = false;
+      return result;
+    }
+    return result;
+  }
+
+  /**
+   * Sets the index key value at the given index
+   * @tparam T type of value
+   * @param col_idx index of the key
+   * @param value value to write
+   * @param null whether the value is null
+   */
+  template <typename T, bool Nullable>
+  void Set(const uint16_t col_idx, const T &value, const bool null) {
+    if constexpr (Nullable) {
+      if (null) {
+        SetNull(static_cast<uint16_t>(col_idx));
+      } else {
+        *reinterpret_cast<T *>(AccessForceNotNull(col_idx)) = value;
+      }
+    } else {  // NOLINT
+      *reinterpret_cast<T *>(AccessForceNotNull(col_idx)) = value;
+    }
+  }
+
  private:
   friend class ProjectedRowInitializer;
+  friend class LogSerializerTask;
   uint32_t size_;
   uint16_t num_cols_;
   byte varlen_contents_[0];
@@ -195,23 +251,36 @@ class ProjectedRowInitializer {
    * @param layout BlockLayout of the RawBlock to be accessed
    * @param col_ids projection list of column ids to map, should have all unique values (no repeats)
    */
-  static ProjectedRowInitializer CreateProjectedRowInitializer(const BlockLayout &layout,
-                                                               std::vector<col_id_t> col_ids);
+  static ProjectedRowInitializer Create(const BlockLayout &layout, std::vector<col_id_t> col_ids);
 
   /**
    * Constructs a ProjectedRowInitializer. Calculates the size of this ProjectedRow, including all members, values,
    * bitmap, and potential padding, and the offsets to jump to for each value. This information is cached for repeated
    * initialization.
    *
-   * @tparam AttrType datatype of attribute sizes
    * @param real_attr_sizes unsorted REAL attribute sizes, e.g. they shouldn't use MSB to indicate varlen.
    * @param pr_offsets pr_offsets[i] = projection list offset of attr_sizes[i] after it gets sorted
    */
-  template <typename AttrType>
-  static ProjectedRowInitializer CreateProjectedRowInitializerForIndexes(std::vector<AttrType> real_attr_sizes,
-                                                                         const std::vector<uint16_t> &pr_offsets);
+  static ProjectedRowInitializer Create(std::vector<uint16_t> real_attr_sizes, const std::vector<uint16_t> &pr_offsets);
 
  private:
+  friend class catalog::Catalog;                  // access to the PRI default constructor
+  friend class catalog::DatabaseCatalog;          // access to the PRI default constructor
+  friend class execution::sql::StorageInterface;  // access to the PRI default constructor
+  friend class WriteAheadLoggingTests;
+  friend class AbstractLogProvider;
+
+  /**
+   * Constructs a ProjectedRowInitializer. Calculates the size of this ProjectedRow, including all members, values,
+   * bitmap, and potential padding, and the offsets to jump to for each value. This information is cached for repeated
+   * initialization.
+   *
+   * @param real_attr_sizes unsorted REAL attribute sizes, e.g. they shouldn't use MSB to indicate varlen.
+   * @param col_ids column ids
+   */
+  static ProjectedRowInitializer Create(const std::vector<uint16_t> &real_attr_sizes,
+                                        const std::vector<col_id_t> &col_ids);
+
   /**
    * Constructs a ProjectedRowInitializer. Calculates the size of this ProjectedRow, including all members, values,
    * bitmap, and potential padding, and the offsets to jump to for each value. This information is cached for repeated
@@ -221,8 +290,13 @@ class ProjectedRowInitializer {
    * @param attr_sizes sorted attribute sizes
    * @param col_ids column ids
    */
-  template <typename AttrType>
-  ProjectedRowInitializer(const std::vector<AttrType> &attr_sizes, std::vector<col_id_t> col_ids);
+  ProjectedRowInitializer(const std::vector<uint16_t> &attr_sizes, std::vector<col_id_t> col_ids);
+
+  /**
+   * This exists for classes that need a PRI as a member, but their arguments aren't known at construction. This allows
+   * a default PRI to be constructed and then replaced later without relying on a pointer and heap allocation.
+   */
+  ProjectedRowInitializer() = default;
 
   uint32_t size_ = 0;
   std::vector<col_id_t> col_ids_;

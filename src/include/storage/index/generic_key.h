@@ -9,12 +9,13 @@
 #include "storage/index/index_metadata.h"
 #include "storage/projected_row.h"
 #include "storage/storage_defs.h"
+#include "xxHash/xxh3.h"
 
 namespace terrier::storage::index {
 
 // This is the maximum number of bytes to pack into a single GenericKey template. This constraint is arbitrary and can
-// be increased if 256-bytes is too small for future workloads.
-#define GENERICKEY_MAX_SIZE 256
+// be increased if 256 bytes is too small for future workloads.
+constexpr uint16_t GENERICKEY_MAX_SIZE = 256;
 
 /**
  * GenericKey is a slower key type than CompactIntsKey for use when the constraints of CompactIntsKey make it
@@ -24,25 +25,22 @@ namespace terrier::storage::index {
 template <uint16_t KeySize>
 class GenericKey {
  public:
-  /**
-   * key size in bytes, exposed for hasher and comparators
-   */
-  static constexpr size_t key_size_byte = KeySize;
-  static_assert(KeySize > 0 && KeySize <= GENERICKEY_MAX_SIZE);  // size must be no greater than 256-bits
+  static_assert(KeySize > 0 && KeySize <= GENERICKEY_MAX_SIZE);
 
   /**
    * Set the GenericKey's data based on a ProjectedRow and associated index metadata
    * @param from ProjectedRow to generate GenericKey representation of
    * @param metadata index information, key_schema used to interpret PR data correctly
+   * @param num_attrs Number of attributes
    */
-  void SetFromProjectedRow(const storage::ProjectedRow &from, const IndexMetadata &metadata) {
-    TERRIER_ASSERT(from.NumColumns() == metadata.GetKeySchema().size(),
+  void SetFromProjectedRow(const storage::ProjectedRow &from, const IndexMetadata &metadata, size_t num_attrs) {
+    TERRIER_ASSERT(from.NumColumns() == metadata.GetSchema().GetColumns().size(),
                    "ProjectedRow should have the same number of columns at the original key schema.");
     metadata_ = &metadata;
-    std::memset(key_data_, 0, key_size_byte);
+    std::memset(key_data_, 0, KeySize);
 
     if (metadata.MustInlineVarlen()) {
-      const auto &key_schema = metadata.GetKeySchema();
+      const auto &key_schema = metadata.GetSchema();
       const auto &inlined_attr_sizes = metadata.GetInlinedAttributeSizes();
 
       const ProjectedRowInitializer &generic_key_initializer = metadata.GetInlinedPRInitializer();
@@ -50,7 +48,10 @@ class GenericKey {
       auto *const pr = GetProjectedRow();
       generic_key_initializer.InitializeRow(pr);
 
-      for (uint16_t i = 0; i < key_schema.size(); i++) {
+      UNUSED_ATTRIBUTE const auto &key_cols = key_schema.GetColumns();
+      TERRIER_ASSERT(num_attrs > 0 && num_attrs <= key_cols.size(), "Number of attributes violates invariant");
+
+      for (uint16_t i = 0; i < num_attrs; i++) {
         const auto offset = static_cast<uint16_t>(from.ColumnIds()[i]);
         TERRIER_ASSERT(offset == static_cast<uint16_t>(pr->ColumnIds()[i]), "PRs must have the same comparison order!");
         const byte *const from_attr = from.AccessWithNullCheck(offset);
@@ -58,19 +59,28 @@ class GenericKey {
           pr->SetNull(offset);
         } else {
           const auto inlined_attr_size = inlined_attr_sizes[i];
+          // TODO(Gus): Magic number
           if (inlined_attr_size <= 16) {
             std::memcpy(pr->AccessForceNotNull(offset), from_attr, inlined_attr_sizes[i]);
           } else {
             // Convert the VarlenEntry to be inlined
             const auto varlen = *reinterpret_cast<const VarlenEntry *const>(from_attr);
             byte *const to_attr = pr->AccessForceNotNull(offset);
-            *reinterpret_cast<uint32_t *const>(to_attr) = varlen.Size();
-            std::memcpy(to_attr + sizeof(uint32_t), varlen.Content(), varlen.Size());
+            const auto varlen_size = varlen.Size();
+            *reinterpret_cast<uint32_t *const>(to_attr) = varlen_size;
+            TERRIER_ASSERT(reinterpret_cast<uintptr_t>(to_attr) + sizeof(uint32_t) + varlen_size <=
+                               reinterpret_cast<uintptr_t>(this) + KeySize,
+                           "ProjectedRow will access out of bounds.");
+            std::memcpy(to_attr + sizeof(uint32_t), varlen.Content(), varlen_size);
           }
         }
       }
     } else {
-      std::memcpy(GetProjectedRow(), &from, from.Size());
+      TERRIER_ASSERT(
+          reinterpret_cast<uintptr_t>(GetProjectedRow()) + from.Size() <= reinterpret_cast<uintptr_t>(this) + KeySize,
+          "ProjectedRow will access out of bounds.");
+      // We recast GetProjectedRow() as a workaround for -Wclass-memaccess
+      std::memcpy(static_cast<void *>(GetProjectedRow()), &from, from.Size());
     }
   }
 
@@ -81,7 +91,7 @@ class GenericKey {
     const auto *pr = reinterpret_cast<const ProjectedRow *>(StorageUtil::AlignedPtr(sizeof(uint64_t), key_data_));
     TERRIER_ASSERT(reinterpret_cast<uintptr_t>(pr) % sizeof(uint64_t) == 0,
                    "ProjectedRow must be aligned to 8 bytes for atomicity guarantees.");
-    TERRIER_ASSERT(reinterpret_cast<uintptr_t>(pr) + pr->Size() < reinterpret_cast<uintptr_t>(this) + key_size_byte,
+    TERRIER_ASSERT(reinterpret_cast<uintptr_t>(pr) + pr->Size() <= reinterpret_cast<uintptr_t>(this) + KeySize,
                    "ProjectedRow will access out of bounds.");
     return pr;
   }
@@ -184,19 +194,75 @@ class GenericKey {
     }
   };
 
+  /**
+   * Returns whether this key is less than another key up to num_attrs for comparison.
+   * @param rhs other key to compare against
+   * @param metadata IndexMetadata
+   * @param num_attrs attributes to compare against
+   * @returns whether this is less than other
+   */
+  bool PartialLessThan(const GenericKey<KeySize> &rhs, UNUSED_ATTRIBUTE const IndexMetadata *metadata,
+                       size_t num_attrs) const {
+    const auto &key_schema = GetIndexMetadata().GetSchema();
+    UNUSED_ATTRIBUTE const auto &key_cols = key_schema.GetColumns();
+    TERRIER_ASSERT(num_attrs > 0 && num_attrs <= key_cols.size(), "Invalid num_attrs for generic key");
+
+    for (uint16_t i = 0; i < num_attrs; i++) {
+      const auto *const lhs_pr = GetProjectedRow();
+      const auto *const rhs_pr = rhs.GetProjectedRow();
+
+      const auto offset = static_cast<uint16_t>(lhs_pr->ColumnIds()[i]);
+      TERRIER_ASSERT(lhs_pr->ColumnIds()[i] == rhs_pr->ColumnIds()[i], "Comparison orders should be the same.");
+
+      const byte *const lhs_attr = lhs_pr->AccessWithNullCheck(offset);
+      const byte *const rhs_attr = rhs_pr->AccessWithNullCheck(offset);
+
+      if (lhs_attr == nullptr) {
+        if (rhs_attr == nullptr) {
+          // attributes are both NULL (equal), continue
+          continue;
+        }
+        // lhs is NULL, rhs is non-NULL, lhs is less than
+        return true;
+      }
+
+      if (rhs_attr == nullptr) {
+        // lhs is non-NULL, rhs is NULL, lhs is greater than
+        return false;
+      }
+
+      const terrier::type::TypeId type_id = key_schema.GetColumns()[i].Type();
+
+      if (terrier::storage::index::GenericKey<KeySize>::TypeComparators::CompareLessThan(type_id, lhs_attr, rhs_attr))
+        return true;
+      if (terrier::storage::index::GenericKey<KeySize>::TypeComparators::CompareGreaterThan(type_id, lhs_attr,
+                                                                                            rhs_attr))
+        return false;
+
+      // attributes are equal, continue
+    }
+
+    // keys are equal
+    return true;
+  }
+
  private:
   ProjectedRow *GetProjectedRow() {
     auto *pr = reinterpret_cast<ProjectedRow *>(StorageUtil::AlignedPtr(sizeof(uint64_t), key_data_));
     TERRIER_ASSERT(reinterpret_cast<uintptr_t>(pr) % sizeof(uint64_t) == 0,
                    "ProjectedRow must be aligned to 8 bytes for atomicity guarantees.");
-    TERRIER_ASSERT(reinterpret_cast<uintptr_t>(pr) + pr->Size() < reinterpret_cast<uintptr_t>(this) + key_size_byte,
+    TERRIER_ASSERT(reinterpret_cast<uintptr_t>(pr) + pr->Size() < reinterpret_cast<uintptr_t>(this) + KeySize,
                    "ProjectedRow will access out of bounds.");
     return pr;
   }
 
-  byte key_data_[key_size_byte];
+  byte key_data_[KeySize];
   const IndexMetadata *metadata_ = nullptr;
 };
+
+extern template class GenericKey<64>;
+extern template class GenericKey<128>;
+extern template class GenericKey<256>;
 
 }  // namespace terrier::storage::index
 
@@ -216,29 +282,22 @@ struct hash<terrier::storage::index::GenericKey<KeySize>> {
   size_t operator()(terrier::storage::index::GenericKey<KeySize> const &key) const {
     const auto &metadata = key.GetIndexMetadata();
 
-    const auto &key_schema = metadata.GetKeySchema();
+    const auto &key_schema = metadata.GetSchema();
     const auto &inlined_attr_sizes = metadata.GetInlinedAttributeSizes();
 
-    uint64_t running_hash = terrier::common::HashUtil::Hash(metadata);
+    uint64_t running_hash = 0;
 
     const auto *const pr = key.GetProjectedRow();
 
-    running_hash = terrier::common::HashUtil::CombineHashes(running_hash, terrier::common::HashUtil::Hash(pr->Size()));
-    running_hash =
-        terrier::common::HashUtil::CombineHashes(running_hash, terrier::common::HashUtil::Hash(pr->NumColumns()));
-
-    for (uint16_t i = 0; i < key_schema.size(); i++) {
+    const auto &key_cols = key_schema.GetColumns();
+    for (uint16_t i = 0; i < key_cols.size(); i++) {
       const auto offset = static_cast<uint16_t>(pr->ColumnIds()[i]);
       const byte *const attr = pr->AccessWithNullCheck(offset);
       if (attr == nullptr) {
-        // attribute is NULL, just hash the nullptr to contribute something to the hash
-        running_hash = terrier::common::HashUtil::CombineHashes(running_hash, terrier::common::HashUtil::Hash(attr));
         continue;
       }
 
-      // just hash the attribute bytes for inlined attributes
-      running_hash = terrier::common::HashUtil::CombineHashes(
-          running_hash, terrier::common::HashUtil::HashBytes(attr, inlined_attr_sizes[i]));
+      running_hash = XXH3_64bits_withSeed(reinterpret_cast<const void *>(attr), inlined_attr_sizes[i], running_hash);
     }
 
     return running_hash;
@@ -246,7 +305,7 @@ struct hash<terrier::storage::index::GenericKey<KeySize>> {
 };
 
 /**
- * Implements std::equal_to for GenericKey. Allows the class to be used with STL containers and the BwTree index.
+ * Implements std::equal_to for GenericKey. Allows the class to be used with containers that expect STL interface.
  * @tparam KeySize number of bytes for the key's internal buffer
  */
 template <uint16_t KeySize>
@@ -258,9 +317,10 @@ struct equal_to<terrier::storage::index::GenericKey<KeySize>> {
    */
   bool operator()(const terrier::storage::index::GenericKey<KeySize> &lhs,
                   const terrier::storage::index::GenericKey<KeySize> &rhs) const {
-    const auto &key_schema = lhs.GetIndexMetadata().GetKeySchema();
+    const auto &key_schema = lhs.GetIndexMetadata().GetSchema();
 
-    for (uint16_t i = 0; i < key_schema.size(); i++) {
+    const auto &key_cols = key_schema.GetColumns();
+    for (uint16_t i = 0; i < key_cols.size(); i++) {
       const auto *const lhs_pr = lhs.GetProjectedRow();
       const auto *const rhs_pr = rhs.GetProjectedRow();
 
@@ -284,7 +344,7 @@ struct equal_to<terrier::storage::index::GenericKey<KeySize>> {
         return false;
       }
 
-      const terrier::type::TypeId type_id = key_schema[i].GetType();
+      const terrier::type::TypeId type_id = key_schema.GetColumns()[i].Type();
 
       if (!terrier::storage::index::GenericKey<KeySize>::TypeComparators::CompareEquals(type_id, lhs_attr, rhs_attr)) {
         // one of the attrs didn't match, return non-equal
@@ -300,7 +360,7 @@ struct equal_to<terrier::storage::index::GenericKey<KeySize>> {
 };
 
 /**
- * Implements std::less for GenericKey. Allows the class to be used with STL containers and the BwTree index.
+ * Implements std::less for GenericKey. Allows the class to be used with containers that expect STL interface.
  * @tparam KeySize number of bytes for the key's internal buffer
  */
 template <uint16_t KeySize>
@@ -312,9 +372,10 @@ struct less<terrier::storage::index::GenericKey<KeySize>> {
    */
   bool operator()(const terrier::storage::index::GenericKey<KeySize> &lhs,
                   const terrier::storage::index::GenericKey<KeySize> &rhs) const {
-    const auto &key_schema = lhs.GetIndexMetadata().GetKeySchema();
+    const auto &key_schema = lhs.GetIndexMetadata().GetSchema();
+    const auto &key_cols = key_schema.GetColumns();
 
-    for (uint16_t i = 0; i < key_schema.size(); i++) {
+    for (uint16_t i = 0; i < key_cols.size(); i++) {
       const auto *const lhs_pr = lhs.GetProjectedRow();
       const auto *const rhs_pr = rhs.GetProjectedRow();
 
@@ -338,7 +399,7 @@ struct less<terrier::storage::index::GenericKey<KeySize>> {
         return false;
       }
 
-      const terrier::type::TypeId type_id = key_schema[i].GetType();
+      const terrier::type::TypeId type_id = key_schema.GetColumns()[i].Type();
 
       if (terrier::storage::index::GenericKey<KeySize>::TypeComparators::CompareLessThan(type_id, lhs_attr, rhs_attr))
         return true;

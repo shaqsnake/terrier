@@ -1,10 +1,13 @@
 #pragma once
 
 #include <event2/thread.h>
+
 #include <unordered_set>
+
 #include "common/dedicated_thread_task.h"
 #include "common/event_util.h"
 #include "common/macros.h"
+#include "loggers/common_logger.h"
 
 namespace terrier::common {
 
@@ -43,7 +46,7 @@ class NotifiableTask : public DedicatedThreadTask {
    * Destructs this NotifiableTask. All events currently registered to its base
    * are also deleted and freed.
    */
-  virtual ~NotifiableTask();
+  ~NotifiableTask() override;
 
   /**
    * @return unique id assigned to this task
@@ -154,7 +157,7 @@ class NotifiableTask : public DedicatedThreadTask {
    */
   void EventLoop() {
     EventUtil::EventBaseDispatch(base_);
-    LOG_TRACE("stop");
+    COMMON_LOG_TRACE("stop");
   }
 
   /**
@@ -170,7 +173,7 @@ class NotifiableTask : public DedicatedThreadTask {
   /**
    * Exits the event loop
    */
-  virtual void ExitLoop() { event_active(terminate_, 0, 0); }
+  void ExitLoop() { event_active(terminate_, 0, 0); }
 
   /**
    * Wrapper around ExitLoop() to conform to libevent callback signature

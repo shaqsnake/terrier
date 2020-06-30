@@ -2,12 +2,13 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
 #include "common/object_pool.h"
 #include "storage/data_table.h"
 #include "storage/storage_defs.h"
 #include "storage/storage_util.h"
-#include "util/storage_test_util.h"
-#include "util/test_harness.h"
+#include "test_util/storage_test_util.h"
+#include "test_util/test_harness.h"
 
 namespace terrier {
 
@@ -19,15 +20,9 @@ struct DeltaRecordTests : public TerrierTest {
   storage::BlockStore block_store_{10, 10};
 
  protected:
-  void SetUp() override {
-    TerrierTest::SetUp();
-    raw_block_ = block_store_.Get();
-  }
+  void SetUp() override { raw_block_ = block_store_.Get(); }
 
-  void TearDown() override {
-    block_store_.Release(raw_block_);
-    TerrierTest::TearDown();
-  }
+  void TearDown() override { block_store_.Release(raw_block_); }
 };
 
 // Generates a list of UndoRecords and chain them together. Access from the beginning and see if we can access all
@@ -45,10 +40,11 @@ TEST_F(DeltaRecordTests, UndoChainAccess) {
       storage::BlockLayout layout = StorageTestUtil::RandomLayoutNoVarlen(common::Constants::MAX_COL, &generator_);
       storage::TupleAccessStrategy tested(layout);
       std::memset(reinterpret_cast<void *>(raw_block_), 0, sizeof(storage::RawBlock));
-      tested.InitializeRawBlock(raw_block_, storage::layout_version_t(0));
+      tested.InitializeRawBlock(nullptr, raw_block_, storage::layout_version_t(0));
 
       // get data table
-      storage::DataTable data_table(&block_store_, layout, storage::layout_version_t(0));
+      storage::DataTable data_table(common::ManagedPointer<storage::BlockStore>(&block_store_), layout,
+                                    storage::layout_version_t(0));
 
       // get tuple slot
       storage::TupleSlot slot;
@@ -56,8 +52,7 @@ TEST_F(DeltaRecordTests, UndoChainAccess) {
 
       // compute the size of the buffer
       const std::vector<storage::col_id_t> col_ids = StorageTestUtil::ProjectionListRandomColumns(layout, &generator_);
-      storage::ProjectedRowInitializer initializer =
-          storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, col_ids);
+      storage::ProjectedRowInitializer initializer = storage::ProjectedRowInitializer::Create(layout, col_ids);
       transaction::timestamp_t time = static_cast<transaction::timestamp_t>(timestamp_dist_(generator_));
       auto *record_buffer = common::AllocationUtil::AllocateAligned(storage::UndoRecord::Size(initializer));
       storage::UndoRecord *record =
@@ -83,19 +78,19 @@ TEST_F(DeltaRecordTests, UndoGetProjectedRow) {
     storage::BlockLayout layout = StorageTestUtil::RandomLayoutNoVarlen(common::Constants::MAX_COL, &generator_);
     storage::TupleAccessStrategy tested(layout);
     std::memset(reinterpret_cast<void *>(raw_block_), 0, sizeof(storage::RawBlock));
-    tested.InitializeRawBlock(raw_block_, storage::layout_version_t(0));
+    tested.InitializeRawBlock(nullptr, raw_block_, storage::layout_version_t(0));
 
     // generate a random projectedRow
     std::vector<storage::col_id_t> update_col_ids = StorageTestUtil::ProjectionListAllColumns(layout);
-    storage::ProjectedRowInitializer initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, update_col_ids);
+    storage::ProjectedRowInitializer initializer = storage::ProjectedRowInitializer::Create(layout, update_col_ids);
     auto *redo_buffer = common::AllocationUtil::AllocateAligned(initializer.ProjectedRowSize());
     storage::ProjectedRow *redo = initializer.InitializeRow(redo_buffer);
     // we don't need to populate projected row since we only copying the layout when we create a UndoRecord using
     // projected row
 
     // get data table
-    storage::DataTable data_table(&block_store_, layout, storage::layout_version_t(0));
+    storage::DataTable data_table(common::ManagedPointer<storage::BlockStore>(&block_store_), layout,
+                                  storage::layout_version_t(0));
 
     // get tuple slot
     storage::TupleSlot slot;

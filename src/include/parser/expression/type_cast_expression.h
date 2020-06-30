@@ -4,60 +4,39 @@
 #include <utility>
 #include <vector>
 #include "parser/expression/abstract_expression.h"
-#include "parser/expression_defs.h"
-#include "type/type_id.h"
 
 namespace terrier::parser {
 /**
- * Represents a type cast expression.
+ * TypeCastExpression represents cast expressions of the form CAST(expr) or expr::TYPE.
  */
 class TypeCastExpression : public AbstractExpression {
+  // TODO(Ling):  Do we need a separate class for operator_cast? We can put it in operatorExpression
+  // Wan: can you elaborate? How do you envision this being used?
  public:
-  /**
-   * Instantiates a new type cast expression.
-   */
-  TypeCastExpression(type::TypeId type, std::vector<std::shared_ptr<AbstractExpression>> &&children)
-      : AbstractExpression(ExpressionType::OPERATOR_CAST, type, std::move(children)), type_(type) {}
+  /** Instantiates a new type cast expression. */
+  TypeCastExpression(type::TypeId type, std::vector<std::unique_ptr<AbstractExpression>> &&children)
+      : AbstractExpression(ExpressionType::OPERATOR_CAST, type, std::move(children)) {}
 
-  /**
-   * Default constructor for deserialization
-   */
+  /** Default constructor for JSON deserialization. */
   TypeCastExpression() = default;
 
-  std::shared_ptr<AbstractExpression> Copy() const override { return std::make_shared<TypeCastExpression>(*this); }
-
   /**
-   * @return The type this node casts to
+   * Copies this TypeCastExpression
+   * @returns copy of this
    */
-  type::TypeId GetType() const { return type_; }
-
-  bool operator==(const AbstractExpression &rhs) const override {
-    if (!AbstractExpression::operator==(rhs)) return false;
-    auto const &other = dynamic_cast<const TypeCastExpression &>(rhs);
-    return GetType() == other.GetType();
-  }
-
+  std::unique_ptr<AbstractExpression> Copy() const override;
   /**
-   * @return expression serialized to json
+   * Creates a copy of the current AbstractExpression with new children implanted.
+   * The children should not be owned by any other AbstractExpression.
+   * @param children New children to be owned by the copy
+   * @returns copy of this with new children
    */
-  nlohmann::json ToJson() const override {
-    nlohmann::json j = AbstractExpression::ToJson();
-    j["type"] = type_;
-    return j;
-  }
+  std::unique_ptr<AbstractExpression> CopyWithChildren(
+      std::vector<std::unique_ptr<AbstractExpression>> &&children) const override;
 
-  /**
-   * @param j json to deserialize
-   */
-  void FromJson(const nlohmann::json &j) override {
-    AbstractExpression::FromJson(j);
-    type_ = j.at("type").get<type::TypeId>();
-  }
-
- private:
-  type::TypeId type_;
+  void Accept(common::ManagedPointer<binder::SqlNodeVisitor> v) override { v->Visit(common::ManagedPointer(this)); }
 };
 
-DEFINE_JSON_DECLARATIONS(TypeCastExpression);
+DEFINE_JSON_HEADER_DECLARATIONS(TypeCastExpression);
 
 }  // namespace terrier::parser

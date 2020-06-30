@@ -5,8 +5,8 @@
 #include "storage/data_table.h"
 #include "storage/storage_defs.h"
 #include "storage/storage_util.h"
-#include "util/storage_test_util.h"
-#include "util/test_harness.h"
+#include "test_util/storage_test_util.h"
+#include "test_util/test_harness.h"
 
 namespace terrier {
 
@@ -27,8 +27,7 @@ TEST_F(ProjectedRowTests, Nulls) {
 
     // generate a random projectedRow
     std::vector<storage::col_id_t> update_col_ids = StorageTestUtil::ProjectionListAllColumns(layout);
-    storage::ProjectedRowInitializer initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, update_col_ids);
+    storage::ProjectedRowInitializer initializer = storage::ProjectedRowInitializer::Create(layout, update_col_ids);
     auto *update_buffer = common::AllocationUtil::AllocateAligned(initializer.ProjectedRowSize());
     storage::ProjectedRow *update = initializer.InitializeRow(update_buffer);
     StorageTestUtil::PopulateRandomRow(update, layout, null_ratio_(generator_), &generator_);
@@ -67,8 +66,7 @@ TEST_F(ProjectedRowTests, CopyProjectedRowLayout) {
 
     // generate a random projectedRow
     std::vector<storage::col_id_t> all_col_ids = StorageTestUtil::ProjectionListAllColumns(layout);
-    storage::ProjectedRowInitializer initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, all_col_ids);
+    storage::ProjectedRowInitializer initializer = storage::ProjectedRowInitializer::Create(layout, all_col_ids);
     auto *buffer = common::AllocationUtil::AllocateAligned(initializer.ProjectedRowSize());
     storage::ProjectedRow *row = initializer.InitializeRow(buffer);
 
@@ -100,12 +98,11 @@ TEST_F(ProjectedRowTests, MemorySafety) {
 
     // generate a random projectedRow
     std::vector<storage::col_id_t> all_col_ids = StorageTestUtil::ProjectionListAllColumns(layout);
-    storage::ProjectedRowInitializer initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, all_col_ids);
+    storage::ProjectedRowInitializer initializer = storage::ProjectedRowInitializer::Create(layout, all_col_ids);
     auto *buffer = common::AllocationUtil::AllocateAligned(initializer.ProjectedRowSize());
     storage::ProjectedRow *row = initializer.InitializeRow(buffer);
 
-    EXPECT_EQ(layout.NumColumns() - NUM_RESERVED_COLUMNS, row->NumColumns());
+    EXPECT_EQ(layout.NumColumns() - storage::NUM_RESERVED_COLUMNS, row->NumColumns());
     void *upper_bound = reinterpret_cast<byte *>(row) + row->Size();
     // check the rest values memory addresses don't overlapping previous addresses.
     for (uint16_t i = 1; i < row->NumColumns(); i++) {
@@ -130,8 +127,7 @@ TEST_F(ProjectedRowTests, Alignment) {
 
     // generate a random projectedRow
     std::vector<storage::col_id_t> all_col_ids = StorageTestUtil::ProjectionListAllColumns(layout);
-    storage::ProjectedRowInitializer initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, all_col_ids);
+    storage::ProjectedRowInitializer initializer = storage::ProjectedRowInitializer::Create(layout, all_col_ids);
     auto *buffer = common::AllocationUtil::AllocateAligned(initializer.ProjectedRowSize());
     storage::ProjectedRow *row = initializer.InitializeRow(buffer);
     for (uint16_t i = 0; i < row->NumColumns(); i++)

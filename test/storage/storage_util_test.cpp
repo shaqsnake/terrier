@@ -1,17 +1,19 @@
 #include "storage/storage_util.h"
-#include <algorithm>
+
 #include <cstring>
-#include <iostream>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
+
+#include "catalog/catalog_defs.h"
+#include "catalog/index_schema.h"
+#include "catalog/schema.h"
 #include "common/object_pool.h"
+#include "parser/expression/constant_value_expression.h"
 #include "storage/data_table.h"
 #include "storage/storage_defs.h"
-#include "util/catalog_test_util.h"
-#include "util/storage_test_util.h"
-#include "util/test_harness.h"
+#include "test_util/storage_test_util.h"
+#include "test_util/test_harness.h"
 
 namespace terrier {
 
@@ -25,15 +27,9 @@ struct StorageUtilTests : public TerrierTest {
   const uint32_t num_iterations_ = 100;
 
  protected:
-  void SetUp() override {
-    TerrierTest::SetUp();
-    raw_block_ = block_store_.Get();
-  }
+  void SetUp() override { raw_block_ = block_store_.Get(); }
 
-  void TearDown() override {
-    block_store_.Release(raw_block_);
-    TerrierTest::TearDown();
-  }
+  void TearDown() override { block_store_.Release(raw_block_); }
 };
 
 // Generate a random projected row layout, copy a pointer location into a projected row, read it back from projected
@@ -47,7 +43,7 @@ TEST_F(StorageUtilTests, CopyToProjectedRow) {
     // generate a random projectedRow
     std::vector<storage::col_id_t> update_col_ids = StorageTestUtil::ProjectionListAllColumns(layout);
     storage::ProjectedRowInitializer update_initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, update_col_ids);
+        storage::ProjectedRowInitializer::Create(layout, update_col_ids);
     auto *row_buffer = common::AllocationUtil::AllocateAligned(update_initializer.ProjectedRowSize());
     storage::ProjectedRow *row = update_initializer.InitializeRow(row_buffer);
 
@@ -83,7 +79,7 @@ TEST_F(StorageUtilTests, CopyToTupleSlot) {
     storage::BlockLayout layout = StorageTestUtil::RandomLayoutNoVarlen(common::Constants::MAX_COL, &generator_);
     storage::TupleAccessStrategy tested(layout);
     std::memset(reinterpret_cast<void *>(raw_block_), 0, sizeof(storage::RawBlock));
-    tested.InitializeRawBlock(raw_block_, storage::layout_version_t(0));
+    tested.InitializeRawBlock(nullptr, raw_block_, storage::layout_version_t(0));
 
     storage::TupleSlot slot;
     EXPECT_TRUE(tested.Allocate(raw_block_, &slot));
@@ -121,8 +117,7 @@ TEST_F(StorageUtilTests, ApplyDelta) {
 
     // the old row
     std::vector<storage::col_id_t> all_col_ids = StorageTestUtil::ProjectionListAllColumns(layout);
-    storage::ProjectedRowInitializer initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, all_col_ids);
+    storage::ProjectedRowInitializer initializer = storage::ProjectedRowInitializer::Create(layout, all_col_ids);
     auto *old_buffer = common::AllocationUtil::AllocateAligned(initializer.ProjectedRowSize());
     storage::ProjectedRow *old = initializer.InitializeRow(old_buffer);
     StorageTestUtil::PopulateRandomRow(old, layout, null_ratio_(generator_), &generator_);
@@ -134,8 +129,7 @@ TEST_F(StorageUtilTests, ApplyDelta) {
 
     // the delta change to apply
     std::vector<storage::col_id_t> rand_col_ids = StorageTestUtil::ProjectionListRandomColumns(layout, &generator_);
-    storage::ProjectedRowInitializer rand_initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout, rand_col_ids);
+    storage::ProjectedRowInitializer rand_initializer = storage::ProjectedRowInitializer::Create(layout, rand_col_ids);
     auto *delta_buffer = common::AllocationUtil::AllocateAligned(rand_initializer.ProjectedRowSize());
     storage::ProjectedRow *delta = rand_initializer.InitializeRow(delta_buffer);
     StorageTestUtil::PopulateRandomRow(delta, layout, null_ratio_(generator_), &generator_);
@@ -146,7 +140,7 @@ TEST_F(StorageUtilTests, ApplyDelta) {
     for (uint16_t delta_col_offset = 0; delta_col_offset < rand_initializer.NumColumns(); ++delta_col_offset) {
       storage::col_id_t col = rand_initializer.ColId(delta_col_offset);
       auto old_col_offset =
-          static_cast<uint16_t>(!col - NUM_RESERVED_COLUMNS);  // since all columns were in the old one
+          static_cast<uint16_t>(!col - storage::NUM_RESERVED_COLUMNS);  // since all columns were in the old one
       byte *delta_val_ptr = delta->AccessWithNullCheck(delta_col_offset);
       byte *old_val_ptr = old->AccessWithNullCheck(old_col_offset);
       if (delta_val_ptr == nullptr) {
@@ -160,7 +154,7 @@ TEST_F(StorageUtilTests, ApplyDelta) {
     // check whether other cols have been polluted
     std::unordered_set<storage::col_id_t> changed_cols(rand_col_ids.begin(), rand_col_ids.end());
     for (uint16_t i = 0; i < old->NumColumns(); ++i) {
-      storage::col_id_t col_id(static_cast<uint16_t>(i + NUM_RESERVED_COLUMNS));
+      storage::col_id_t col_id(static_cast<uint16_t>(i + storage::NUM_RESERVED_COLUMNS));
       if (changed_cols.find(all_col_ids[i]) == changed_cols.end()) {
         byte *ptr = old->AccessWithNullCheck(i);
         if (ptr == nullptr) {
@@ -175,5 +169,21 @@ TEST_F(StorageUtilTests, ApplyDelta) {
     delete[] delta_buffer;
     delete[] old_buffer;
   }
+}
+
+// Ensure that the ForceOid function for schemas works as intended
+// NOLINTNEXTLINE
+TEST_F(StorageUtilTests, ForceOid) {
+  auto index_col = catalog::IndexSchema::Column("", type::TypeId::INTEGER, false,
+                                                parser::ConstantValueExpression(type::TypeId::INTEGER));
+  auto idx_col_oid = catalog::indexkeycol_oid_t(1);
+  StorageTestUtil::ForceOid(&(index_col), idx_col_oid);
+  EXPECT_EQ(index_col.Oid(), idx_col_oid);
+
+  auto col = catalog::Schema::Column("iHateStorage", type::TypeId::INTEGER, false,
+                                     parser::ConstantValueExpression(type::TypeId::INTEGER));
+  auto col_oid = catalog::col_oid_t(2);
+  StorageTestUtil::ForceOid(&(col), col_oid);
+  EXPECT_EQ(col.Oid(), col_oid);
 }
 }  // namespace terrier

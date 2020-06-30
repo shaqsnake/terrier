@@ -1,17 +1,19 @@
-#include <unistd.h>
-#include <cstring>
-
-#include "network/connection_dispatcher_task.h"
 #include "network/connection_handle.h"
+
+#include <unistd.h>
+
+#include <cstring>
+#include <memory>
+#include <utility>
+
+#include "common/utility.h"
+#include "network/connection_dispatcher_task.h"
 #include "network/connection_handle_factory.h"
 #include "network/terrier_server.h"
 
-#include "common/utility.h"
-
 /*
  *  Here we are abusing macro expansion to allow for human readable definition
- *  of the finite state machine's transition table. We put these macros in an
- *  anonymous namespace to avoid them confusing people elsewhere.
+ *  of the finite state machine's transition table.
  *
  *  The macros merely compose a large function. Unless you know what you are
  *  doing, do not modify their definitions.
@@ -43,7 +45,7 @@
 // undefined state or transition on said state will throw a runtime error.
 
 #define DEF_TRANSITION_GRAPH                                                                                        \
-  ConnectionHandle::StateMachine::transition_result ConnectionHandle::StateMachine::Delta_(ConnState state,         \
+  ConnectionHandle::StateMachine::transition_result ConnectionHandle::StateMachine::Delta(ConnState state,         \
                                                                                            Transition transition) { \
     switch (state) {
 #define DEFINE_STATE(s) \
@@ -56,33 +58,33 @@
   {                     \
     ConnState::s,
 #define AND_INVOKE(m)                         \
-  ([](ConnectionHandle &w) { return w.m(); }) \
+  ([](const common::ManagedPointer<ConnectionHandle> w) { return w->m(); }) \
   };                                          // NOLINT
 
 #define AND_WAIT_ON_READ                      \
-  ([](ConnectionHandle &w) {                  \
-    w.UpdateEventFlags(EV_READ | EV_PERSIST); \
+  ([](const common::ManagedPointer<ConnectionHandle> w) {                  \
+    w->UpdateEventFlags(EV_READ | EV_PERSIST); \
     return Transition::NONE;                  \
   })                                          \
   };                                          // NOLINT
 
 #define AND_WAIT_ON_WRITE                      \
-  ([](ConnectionHandle &w) {                   \
-    w.UpdateEventFlags(EV_WRITE | EV_PERSIST); \
+  ([](const common::ManagedPointer<ConnectionHandle> w) {                   \
+    w->UpdateEventFlags(EV_WRITE | EV_PERSIST); \
     return Transition::NONE;                   \
   })                                           \
   };                                            // NOLINT
 
 #define AND_WAIT_ON_TERRIER        \
-  ([](ConnectionHandle &w) {       \
-    w.StopReceivingNetworkEvent(); \
+  ([](const common::ManagedPointer<ConnectionHandle> w) {       \
+    w->StopReceivingNetworkEvent(); \
     return Transition::NONE;       \
   })                               \
   };                               // NOLINT
 
 #define AND_WAIT_ON_READ_TIMEOUT        \
-  ([](ConnectionHandle &w) {       \
-    w.UpdateEventFlags(EV_READ | EV_PERSIST | EV_TIMEOUT, READ_TIMEOUT); \
+  ([](const common::ManagedPointer<ConnectionHandle> w) {       \
+    w->UpdateEventFlags(EV_READ | EV_PERSIST | EV_TIMEOUT, READ_TIMEOUT); \
     return Transition::NONE;       \
   })                               \
   };                               // NOLINT
@@ -143,10 +145,11 @@ DEF_TRANSITION_GRAPH
 END_DEF
     // clang-format on
 
-    void ConnectionHandle::StateMachine::Accept(Transition action, ConnectionHandle &connection) {
+    void ConnectionHandle::StateMachine::Accept(Transition action,
+                                                const common::ManagedPointer<ConnectionHandle> connection) {
   Transition next = action;
   while (next != Transition::NONE) {
-    transition_result result = Delta_(current_state_, next);
+    transition_result result = Delta(current_state_, next);
     current_state_ = result.first;
     try {
       next = result.second(connection);
@@ -157,12 +160,6 @@ END_DEF
   }
 }
 
-// TODO(Tianyu): Maybe use a factory to initialize protocol_interpreter here
-ConnectionHandle::ConnectionHandle(int sock_fd, ConnectionHandlerTask *handler)
-    : conn_handler_(handler),
-      io_wrapper_{new NetworkIoWrapper(sock_fd)},
-      protocol_interpreter_{new PostgresProtocolInterpreter()} {}
-
 Transition ConnectionHandle::GetResult() {
   EventUtil::EventAdd(network_event_, nullptr);
   protocol_interpreter_->GetResult(io_wrapper_->GetWriteQueue());
@@ -172,6 +169,10 @@ Transition ConnectionHandle::GetResult() {
 
 Transition ConnectionHandle::TryCloseConnection() {
   NETWORK_LOG_TRACE("Attempt to close the connection {0}", io_wrapper_->GetSocketFd());
+
+  protocol_interpreter_->Teardown(io_wrapper_->GetReadBuffer(), io_wrapper_->GetWriteQueue(), traffic_cop_,
+                                  common::ManagedPointer(&context_));
+
   Transition close = io_wrapper_->Close();
   if (close != Transition::PROCEED) return close;
   // Remove listening event
@@ -180,6 +181,7 @@ Transition ConnectionHandle::TryCloseConnection() {
   // connection handle and we will need to destruct and exit.
   conn_handler_->UnregisterEvent(network_event_);
   conn_handler_->UnregisterEvent(workpool_event_);
+
   return Transition::NONE;
 }
 

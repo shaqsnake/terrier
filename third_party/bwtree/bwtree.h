@@ -7,6 +7,7 @@
 #include <chrono>  // NOLINT
 #include <cinttypes>
 #include <cstddef>  // offsetof() is defined here
+#include <deque>
 #include <functional>
 #include <thread>  // NOLINT
 #include <unordered_set>
@@ -107,6 +108,19 @@ class BwTreeBase {
 
   // We invoke the GC procedure after this has been reached
   static constexpr size_t GC_NODE_COUNT_THREADHOLD = 1024;
+
+  /** @return inner_delta_chain_length_threshold */
+  int GetInnerDeltaChainLengthThreshold() const { return inner_delta_chain_length_threshold_; }
+  /** @return leaf_delta_chain_length_threshold */
+  int GetLeafDeltaChainLengthThreshold() const { return leaf_delta_chain_length_threshold_; }
+  /** @return inner_node_size_upper_threshold */
+  int GetInnerNodeSizeUpperThreshold() const { return inner_node_size_upper_threshold_; }
+  /** @return inner_node_size_lower_threshold */
+  int GetInnerNodeSizeLowerThreshold() const { return inner_node_size_lower_threshold_; }
+  /** @return leaf_node_size_upper_threshold */
+  int GetLeafNodeSizeUpperThreshold() const { return leaf_node_size_upper_threshold_; }
+  /** @return leaf_node_size_lower_threshold */
+  int GetLeafNodeSizeLowerThreshold() const { return leaf_node_size_lower_threshold_; }
 
   /*
    * class GarbageNode - Garbage node used to represent delayed allocation
@@ -224,6 +238,52 @@ class BwTreeBase {
   // This is current epoch
   // We need to make it atomic since multiple threads might try to modify it
   uint64_t epoch;
+
+ protected:
+  /** @param inner_delta_chain_length_threshold depth threshold for inner node chain to be assigned to this tree */
+  void SetInnerDeltaChainLengthThreshold(int inner_delta_chain_length_threshold) {
+    inner_delta_chain_length_threshold_ = inner_delta_chain_length_threshold;
+  }
+
+  /** @param leaf_delta_chain_length_threshold depth threshold for leaf node chain to be assigned to this tree */
+  void SetLeafDeltaChainLengthThreshold(int leaf_delta_chain_length_threshold) {
+    leaf_delta_chain_length_threshold_ = leaf_delta_chain_length_threshold;
+  }
+
+  /** @param inner_node_size_upper_threshold upper size threshold for inner node split to be assigned to this tree */
+  void SetInnerNodeSizeUpperThreshold(int inner_node_size_upper_threshold) {
+    inner_node_size_upper_threshold_ = inner_node_size_upper_threshold;
+  }
+
+  /** @param inner_node_size_upper_threshold lower size threshold for inner node removal to be assigned to this tree */
+  void SetInnerNodeSizeLowerThreshold(int inner_node_size_lower_threshold) {
+    inner_node_size_lower_threshold_ = inner_node_size_lower_threshold;
+  }
+
+  /** @param leaf_node_size_upper_threshold upper size threshold for leaf node split to be assigned to this tree */
+  void SetLeafNodeSizeUpperThreshold(int leaf_node_size_upper_threshold) {
+    leaf_node_size_upper_threshold_ = leaf_node_size_upper_threshold;
+  }
+
+  /** @param inner_node_size_upper_threshold lower size threshold for leaf node removal to be assigned to this tree */
+  void SetLeafNodeSizeLowerThreshold(int leaf_node_size_lower_threshold) {
+    leaf_node_size_lower_threshold_ = leaf_node_size_lower_threshold;
+  }
+
+  /** depth threshold for inner node chain */
+  int inner_delta_chain_length_threshold_ = INNER_DELTA_CHAIN_LENGTH_THRESHOLD;
+  /** depth threshold for leaf node chain */
+  int leaf_delta_chain_length_threshold_ = LEAF_DELTA_CHAIN_LENGTH_THRESHOLD;
+
+  /** upper size threshold for inner node split */
+  int inner_node_size_upper_threshold_ = INNER_NODE_SIZE_UPPER_THRESHOLD;
+  /** lower size threshold for inner node removal */
+  int inner_node_size_lower_threshold_ = INNER_NODE_SIZE_LOWER_THRESHOLD;
+
+  /** upper size threshold for leaf node split */
+  int leaf_node_size_upper_threshold_ = LEAF_NODE_SIZE_UPPER_THRESHOLD;
+  /** lower size threshold for leaf node removal */
+  int leaf_node_size_lower_threshold_ = LEAF_NODE_SIZE_LOWER_THRESHOLD;
 
  public:
   /*
@@ -935,7 +995,7 @@ class BwTree : public BwTreeBase {
         : metadata{p_low_key_p, p_high_key_p, p_type, p_depth, p_item_count} {}
 
     /*
-     * GetType() - Return the type of node
+     * Type() - Return the type of node
      *
      * This method does not allow overridding
      */
@@ -2052,7 +2112,7 @@ class BwTree : public BwTreeBase {
       // This size is exactly the index of the split point
       int left_sibling_size = std::distance(this->Begin(), it);
 
-      if (left_sibling_size > static_cast<int>(LEAF_NODE_SIZE_LOWER_THRESHOLD)) {
+      if (left_sibling_size > static_cast<int>(t->GetLeafNodeSizeLowerThreshold())) {
         return left_sibling_size;
       }
 
@@ -2067,7 +2127,7 @@ class BwTree : public BwTreeBase {
 
       int right_sibling_size = std::distance(it, this->End());
 
-      if (right_sibling_size > static_cast<int>(LEAF_NODE_SIZE_LOWER_THRESHOLD)) {
+      if (right_sibling_size > static_cast<int>(t->GetLeafNodeSizeLowerThreshold())) {
         return std::distance(this->Begin(), it);
       }
 
@@ -2195,7 +2255,8 @@ class BwTree : public BwTreeBase {
         next_unused_node_id{1},
 
         // Initialize free NodeID stack
-        free_node_id_list{},
+        node_id_list_lock{},
+        node_id_list{},
 
         // Statistical information
         insert_op_count{0},
@@ -2330,8 +2391,11 @@ class BwTree : public BwTreeBase {
    * DO NOT call this in worker thread!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
    */
   inline void InvalidateNodeID(NodeID node_id) {
+    node_id_list_lock.lock();
     mapping_table[node_id] = nullptr;
-    free_node_id_list.SingleThreadPush(node_id);
+    node_id_list.push_back(node_id);
+    // free_node_id_list.SingleThreadPush(node_id);
+    node_id_list_lock.unlock();
   }
 
   /*
@@ -2546,8 +2610,8 @@ class BwTree : public BwTreeBase {
    * the mapping table rather than CAS with nullptr
    */
   void InitMappingTable() {
-    mapping_table = (std::atomic<const BaseNode *> *)mmap(nullptr, sizeof(BaseNode *) * MAPPING_TABLE_SIZE, PROT_READ | PROT_WRITE,
-                                                          MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    mapping_table = (std::atomic<const BaseNode *> *)mmap(nullptr, sizeof(BaseNode *) * MAPPING_TABLE_SIZE,
+                                                          PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     // If allocation fails, we throw an error because this is uncoverable
     // The upper level functions should either catch this exception
     // and then use another index instead, or simply kill the system
@@ -2574,16 +2638,16 @@ class BwTree : public BwTreeBase {
     // If the first element is true then the NodeID is a valid one
     // If the first element is false then NodeID is invalid and the
     // stack is either empty or being used (we cannot lock and wait)
-    auto ret_pair = free_node_id_list.Pop();
-
-    // If there is no free node id
-    if (!ret_pair.first) {
-      // fetch_add() returns the old value and increase the atomic
-      // automatically
-      return next_unused_node_id.fetch_add(1);
+    NodeID ret;
+    node_id_list_lock.lock();
+    if (node_id_list.size() == 0) {
+      ret = next_unused_node_id.fetch_add(1);
+    } else {
+      ret = node_id_list.front();
+      node_id_list.pop_front();
     }
-
-    return ret_pair.second;
+    node_id_list_lock.unlock();
+    return ret;
   }
 
   /*
@@ -4758,7 +4822,9 @@ class BwTree : public BwTreeBase {
 
         return;
       }  // case Inner/LeafRemoveType
-      default: { return; }
+      default: {
+        return;
+      }
     }  // switch
 
     TERRIER_ASSERT(false, "Cannot reach here.");
@@ -4934,7 +5000,11 @@ class BwTree : public BwTreeBase {
       if (snapshot_p->IsLeaf()) {
         INDEX_LOG_TRACE("The next node is a leaf (RO)");
 
-        NavigateLeafNode(context_p, *value_list_p);
+        if (value_list_p == nullptr) {
+          NavigateSiblingChain(context_p);
+        } else {
+          NavigateLeafNode(context_p, *value_list_p);
+        }
 
         if (context_p->abort_flag) {
           INDEX_LOG_TRACE("NavigateLeafNode aborts (RO). ABORT");
@@ -5592,11 +5662,11 @@ class BwTree : public BwTreeBase {
     int depth = node_p->GetDepth();
 
     if (snapshot_p->IsLeaf()) {
-      if (depth < LEAF_DELTA_CHAIN_LENGTH_THRESHOLD) {
+      if (depth < GetLeafDeltaChainLengthThreshold()) {
         return;
       }
     } else {
-      if (depth < INNER_DELTA_CHAIN_LENGTH_THRESHOLD) {
+      if (depth < GetInnerDeltaChainLengthThreshold()) {
         return;
       }
     }
@@ -5647,7 +5717,7 @@ class BwTree : public BwTreeBase {
       size_t node_size = leaf_node_p->GetItemCount();
 
       // Perform corresponding action based on node size
-      if (node_size >= LEAF_NODE_SIZE_UPPER_THRESHOLD) {
+      if (node_size >= GetLeafNodeSizeUpperThreshold()) {
         INDEX_LOG_TRACE("Node size >= leaf upper threshold. Split");
 
         // Note: This function takes this as argument since it will
@@ -5789,7 +5859,7 @@ class BwTree : public BwTreeBase {
 
       size_t node_size = inner_node_p->GetSize();
 
-      if (node_size >= INNER_NODE_SIZE_UPPER_THRESHOLD) {
+      if (node_size >= GetInnerNodeSizeUpperThreshold()) {
         INDEX_LOG_TRACE("Node size >= inner upper threshold. Split");
 
         const InnerNode *new_inner_node_p = inner_node_p->GetSplitSibling();
@@ -5867,7 +5937,7 @@ class BwTree : public BwTreeBase {
 
         return;
         // if CAS fails
-      } else if (node_size <= INNER_NODE_SIZE_LOWER_THRESHOLD) {
+      } else if (node_size <= GetInnerNodeSizeLowerThreshold()) {
         if (context_p->IsOnRootNode()) {
           INDEX_LOG_TRACE("Root underflow - let it be");
 
@@ -6827,7 +6897,9 @@ class BwTree : public BwTreeBase {
 
   // This list holds free NodeID which was removed by remove delta
   // We recycle NodeID in epoch manager
-  bwtree::AtomicStack<NodeID, MAPPING_TABLE_SIZE> free_node_id_list;
+
+  std::mutex node_id_list_lock;
+  std::deque<NodeID> node_id_list;
 
   std::atomic<uint64_t> insert_op_count;
   std::atomic<uint64_t> insert_abort_count;
@@ -8141,7 +8213,6 @@ class BwTree : public BwTreeBase {
         // First join the epoch to prevent physical nodes being deallocated
         // too early
         EpochNode *epoch_node_p = p_tree_p->epoch_manager.JoinEpoch();
-
         // This traversal has the following characteristics:
         //   1. It stops at the leaf level without traversing leaf with the key
         //   2. It DOES finish partial SMO, consolidate overlengthed chain, etc.

@@ -3,39 +3,41 @@
 #include <memory>
 #include <vector>
 #include "parser/expression/abstract_expression.h"
-#include "parser/expression_defs.h"
-#include "type/type_id.h"
 
 namespace terrier::parser {
 /**
- * Represents a star, e.g. COUNT(*).
+ * StarExpression represents a star in expressions like COUNT(*).
  */
 class StarExpression : public AbstractExpression {
  public:
   /**
-   * Instantiates a new star expression, e.g. as in COUNT(*)
+   * Instantiates a new star expression, e.g. as in COUNT(*).
    */
-  StarExpression() : AbstractExpression(ExpressionType::STAR, type::TypeId::INVALID, {}) {}
-
-  std::shared_ptr<AbstractExpression> Copy() const override {
-    // TODO(Tianyu): This really should be a singleton object
-    return std::make_shared<StarExpression>(*this);
-  }
+  StarExpression() : AbstractExpression(ExpressionType::STAR, type::TypeId::INTEGER, {}) {}
 
   /**
-   * @return expression serialized to json
+   * Copies this StarExpression
+   * @returns this
    */
-  nlohmann::json ToJson() const override {
-    nlohmann::json j = AbstractExpression::ToJson();
-    return j;
-  }
+  std::unique_ptr<AbstractExpression> Copy() const override;
+  // TODO(Tianyu): This really should be a singleton object
+  // ^WAN: jokes on you there's mutable state now and it can't be hahahaha
 
   /**
-   * @param j json to deserialize
+   * Creates a copy of the current AbstractExpression with new children implanted.
+   * The children should not be owned by any other AbstractExpression.
+   * @param children New children to be owned by the copy
+   * @returns copy of this
    */
-  void FromJson(const nlohmann::json &j) override { AbstractExpression::FromJson(j); }
+  std::unique_ptr<AbstractExpression> CopyWithChildren(
+      std::vector<std::unique_ptr<AbstractExpression>> &&children) const override {
+    TERRIER_ASSERT(children.empty(), "StarExpression should have 0 children");
+    return Copy();
+  }
+
+  void Accept(common::ManagedPointer<binder::SqlNodeVisitor> v) override { v->Visit(common::ManagedPointer(this)); }
 };
 
-DEFINE_JSON_DECLARATIONS(StarExpression);
+DEFINE_JSON_HEADER_DECLARATIONS(StarExpression);
 
 }  // namespace terrier::parser

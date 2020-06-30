@@ -1,16 +1,21 @@
 #pragma once
+
 #include <queue>
 #include <unordered_set>
 #include <utility>
-#include "common/shared_latch.h"
+
+#include "common/gate.h"
 #include "common/spin_latch.h"
 #include "common/strong_typedef.h"
-#include "storage/data_table.h"
 #include "storage/record_buffer.h"
 #include "storage/undo_record.h"
-#include "storage/write_ahead_log/log_manager.h"
+#include "transaction/timestamp_manager.h"
 #include "transaction/transaction_context.h"
 #include "transaction/transaction_defs.h"
+
+namespace terrier::storage {
+class LogManager;
+}  // namespace terrier::storage
 
 namespace terrier::transaction {
 /**
@@ -23,13 +28,23 @@ class TransactionManager {
   /**
    * Initializes a new transaction manager. Transactions will use the given object pool as source of their undo
    * buffers.
+   * @param timestamp_manager timestamp manager that manages timestamps for transactions
+   * @param deferred_action_manager deferred action manager to use for transactions
    * @param buffer_pool the buffer pool to use for transaction undo buffers
    * @param gc_enabled true if txns should be stored in a local queue to hand off to the GC, false otherwise
-   * @param log_manager the log manager in the system, or LOGGING_DISABLED(nulllptr) if logging is turned off.
+   * @param log_manager the log manager in the system, or DISABLED(nulllptr) if logging is turned off.
    */
-  TransactionManager(storage::RecordBufferSegmentPool *const buffer_pool, const bool gc_enabled,
-                     storage::LogManager *log_manager)
-      : buffer_pool_(buffer_pool), gc_enabled_(gc_enabled), log_manager_(log_manager) {}
+  TransactionManager(const common::ManagedPointer<TimestampManager> timestamp_manager,
+                     const common::ManagedPointer<DeferredActionManager> deferred_action_manager,
+                     const common::ManagedPointer<storage::RecordBufferSegmentPool> buffer_pool, bool gc_enabled,
+                     const common::ManagedPointer<storage::LogManager> log_manager)
+      : timestamp_manager_(timestamp_manager),
+        deferred_action_manager_(deferred_action_manager),
+        buffer_pool_(buffer_pool),
+        gc_enabled_(gc_enabled),
+        log_manager_(log_manager) {
+    TERRIER_ASSERT(timestamp_manager_ != DISABLED, "transaction manager cannot function without a timestamp manager");
+  }
 
   /**
    * Begins a transaction.
@@ -49,21 +64,9 @@ class TransactionManager {
   /**
    * Aborts a transaction, rolling back its changes (if any).
    * @param txn the transaction to abort.
+   * @return abort timestamp of this transaction.
    */
-  void Abort(TransactionContext *txn);
-
-  /**
-   * Get the oldest transaction alive in the system at this time. Because of concurrent operations, it
-   * is not guaranteed that upon return the txn is still alive. However, it is guaranteed that the return
-   * timestamp is older than any transactions live.
-   * @return timestamp that is older than any transactions alive
-   */
-  timestamp_t OldestTransactionStartTime() const;
-
-  /**
-   * @return unique timestamp based on current time, and advances one tick
-   */
-  timestamp_t GetTimestamp() { return time_++; }
+  timestamp_t Abort(TransactionContext *txn);
 
   /**
    * @return true if gc_enabled and storing completed txns in local queue, false otherwise
@@ -76,50 +79,23 @@ class TransactionManager {
    */
   TransactionQueue CompletedTransactionsForGC();
 
-  /**
-   * Adds the action to a buffered list of deferred actions.  This action will
-   * be triggered no sooner than when the epoch (timestamp of oldest running
-   * transaction) is more recent than the time this function was called.
-   * @param a functional implementation of the action that is deferred
-   */
-  void DeferAction(Action a);
-
-  /**
-   * Transfers the buffered list of deferred actions to the GC for eventual
-   * execution.
-   * @return the deferred actions as a sorted queue of pairs where the timestamp is
-   *         earliest epoch the associated action can safely fire
-   */
-  std::queue<std::pair<timestamp_t, Action>> DeferredActionsForGC();
-
  private:
-  storage::RecordBufferSegmentPool *buffer_pool_;
-  // TODO(Tianyu): Timestamp generation needs to be more efficient (batches)
-  // TODO(Tianyu): We don't handle timestamp wrap-arounds. I doubt this would be an issue though.
-  std::atomic<timestamp_t> time_{timestamp_t(0)};
+  const common::ManagedPointer<TimestampManager> timestamp_manager_;
+  const common::ManagedPointer<DeferredActionManager> deferred_action_manager_;
+  const common::ManagedPointer<storage::RecordBufferSegmentPool> buffer_pool_;
 
-  // TODO(Tianyu): This is the famed HyPer Latch. We will need to re-evaluate performance later.
-  common::SharedLatch commit_latch_;
-
-  // TODO(Matt): consider a different data structure if this becomes a measured bottleneck
-  std::unordered_set<timestamp_t> curr_running_txns_;
-  mutable common::SpinLatch curr_running_txns_latch_;
+  common::Gate txn_gate_;
 
   bool gc_enabled_ = false;
   TransactionQueue completed_txns_;
-  storage::LogManager *const log_manager_;
+  const common::ManagedPointer<storage::LogManager> log_manager_;
 
-  std::queue<std::pair<timestamp_t, Action>> deferred_actions_;
-  mutable common::SpinLatch deferred_actions_latch_;
+  timestamp_t UpdatingCommitCriticalSection(TransactionContext *txn);
 
-  timestamp_t ReadOnlyCommitCriticalSection(TransactionContext *txn, transaction::callback_fn callback,
-                                            void *callback_arg);
+  void LogCommit(TransactionContext *txn, timestamp_t commit_time, transaction::callback_fn commit_callback,
+                 void *commit_callback_arg, timestamp_t oldest_active_txn);
 
-  timestamp_t UpdatingCommitCriticalSection(TransactionContext *txn, transaction::callback_fn callback,
-                                            void *callback_arg);
-
-  void LogCommit(TransactionContext *txn, timestamp_t commit_time, transaction::callback_fn callback,
-                 void *callback_arg);
+  void LogAbort(TransactionContext *txn);
 
   void Rollback(TransactionContext *txn, const storage::UndoRecord &record) const;
 

@@ -1,20 +1,21 @@
 #include "storage/block_layout.h"
+
 #include <algorithm>
-#include <functional>
 #include <utility>
 #include <vector>
+
 #include "storage/arrow_block_metadata.h"
 #include "storage/storage_util.h"
 
 namespace terrier::storage {
-BlockLayout::BlockLayout(std::vector<uint8_t> attr_sizes)
+BlockLayout::BlockLayout(std::vector<uint16_t> attr_sizes)
     : attr_sizes_(std::move(attr_sizes)),
       tuple_size_(ComputeTupleSize()),
       static_header_size_(ComputeStaticHeaderSize()),
       num_slots_(ComputeNumSlots()),
       header_size_(ComputeHeaderSize()) {
-  for (uint8_t size UNUSED_ATTRIBUTE : attr_sizes_)
-    TERRIER_ASSERT(size == VARLEN_COLUMN || (size >= 0 && size <= INT8_MAX), "Invalid size of a column");
+  for (uint16_t size UNUSED_ATTRIBUTE : attr_sizes_)
+    TERRIER_ASSERT(size == VARLEN_COLUMN || (size >= 0 && size <= INT16_MAX), "Invalid size of a column");
   TERRIER_ASSERT(!attr_sizes_.empty() && static_cast<uint16_t>(attr_sizes_.size()) <= common::Constants::MAX_COL,
                  "number of columns must be between 1 and MAX_COL");
   TERRIER_ASSERT(num_slots_ != 0, "number of slots cannot be 0!");
@@ -28,15 +29,16 @@ BlockLayout::BlockLayout(std::vector<uint8_t> attr_sizes)
 uint32_t BlockLayout::ComputeTupleSize() const {
   uint32_t result = 0;
   // size in attr_sizes_ can be negative to denote varlens.
-  for (auto size : attr_sizes_) result += static_cast<uint8_t>(INT8_MAX & size);
+  for (auto size : attr_sizes_) result += AttrSizeBytes(size);
   return result;
 }
 
 uint32_t BlockLayout::ComputeStaticHeaderSize() const {
-  auto unpadded_size = static_cast<uint32_t>(sizeof(uint32_t) * 2  // layout_version, insert_head
-                                             + sizeof(BlockAccessController) +
-                                             ArrowBlockMetadata::Size(NumColumns())  // access controller and metadata
-                                             + NumColumns() * sizeof(uint32_t));     // attr_offsets
+  auto unpadded_size = static_cast<uint32_t>(
+      sizeof(uintptr_t) + sizeof(uint16_t) + sizeof(layout_version_t) +  // datatable pointer, padding, layout_version
+      sizeof(uint32_t)                                                   // insert_head
+      + sizeof(BlockAccessController) + ArrowBlockMetadata::Size(NumColumns())  // access controller and metadata
+      + NumColumns() * sizeof(uint32_t));                                       // attr_offsets
   return StorageUtil::PadUpToSize(sizeof(uint64_t), unpadded_size);
 }
 

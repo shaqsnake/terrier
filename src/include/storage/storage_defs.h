@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <functional>
 #include <ostream>
+#include <string>
 #include <string_view>  // NOLINT
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
 #include "catalog/catalog_defs.h"
 #include "common/constants.h"
 #include "common/container/bitmap.h"
@@ -17,14 +19,11 @@
 #include "storage/block_access_controller.h"
 
 namespace terrier::storage {
-// Write Ahead Logging:
-#define LOGGING_DISABLED nullptr
-#define ACTION_FRAMEWORK_DISABLED nullptr
 
-// All tuples potentially visible to txns should have a non-null attribute of version vector.
-// This is not to be confused with a non-null version vector that has value nullptr (0).
-#define VERSION_POINTER_COLUMN_ID ::terrier::storage::col_id_t(0)
-#define NUM_RESERVED_COLUMNS 1u
+// Internally we use the sign bit to represent if a column is varlen or not. Down to the implementation detail though,
+// we always allocate 16 bytes for a varlen entry, with the first 8 bytes being the pointer to the value and following
+// 4 bytes be the size of the varlen. There are 4 bytes of padding for alignment purposes.
+constexpr uint16_t VARLEN_COLUMN = static_cast<uint16_t>(0x8010);  // 16 with the first (most significant) bit set to 1
 
 // In type_util.h there are a total of 5 possible inlined attribute sizes:
 // 1, 2, 4, 8, and 16-bytes (16 byte is the structure portion of varlen).
@@ -32,10 +31,18 @@ namespace terrier::storage {
 // columns size by tracking the locations of the attribute size boundaries.
 // Therefore, we only need to track 4 locations because the exterior bounds
 // are implicit.
-#define NUM_ATTR_BOUNDARIES 4
+constexpr uint8_t NUM_ATTR_BOUNDARIES = 4;
 
-STRONG_TYPEDEF(col_id_t, uint16_t);
-STRONG_TYPEDEF(layout_version_t, uint32_t);
+STRONG_TYPEDEF_HEADER(col_id_t, uint16_t);
+STRONG_TYPEDEF_HEADER(layout_version_t, uint16_t);
+
+// All tuples potentially visible to txns should have a non-null attribute of version vector.
+// This is not to be confused with a non-null version vector that has value nullptr (0).
+
+constexpr col_id_t VERSION_POINTER_COLUMN_ID = col_id_t(0);
+constexpr uint8_t NUM_RESERVED_COLUMNS = 1;
+
+class DataTable;
 
 /**
  * A block is a chunk of memory used for storage. It does not have any meaning
@@ -44,7 +51,19 @@ STRONG_TYPEDEF(layout_version_t, uint32_t);
  *
  * @warning If you change the layout please also change the way header sizes are computed in block layout!
  */
-struct alignas(common::Constants::BLOCK_SIZE) RawBlock {
+class alignas(common::Constants::BLOCK_SIZE) RawBlock {
+ public:
+  /**
+   * Data Table for this RawBlock. This is used by indexes and GC to get back to the DataTable given only a TupleSlot
+   */
+  DataTable *data_table_;
+
+  /**
+   * Padding for flags or whatever we may want in the future. Determined by size of layout_version below. See
+   * tuple_access_strategy.h for more details on Block header layout.
+   */
+  uint16_t padding_;
+
   /**
    * Layout version.
    */
@@ -53,6 +72,9 @@ struct alignas(common::Constants::BLOCK_SIZE) RawBlock {
    * The insert head tells us where the next insertion should take place. Notice that this counter is never
    * decreased as slot recycling does not happen on the fly with insertions. A background compaction process
    * scans through blocks and free up slots.
+   * Since the block size is less then (1<<20) the uppper 12 bits of insert_head_ is free. We use the first bit (1<<31)
+   * to indicate if the block is insertable.
+   * If the first bit is 0, the block is insertable, otherwise one txn is inserting to this block
    */
   std::atomic<uint32_t> insert_head_;
   /**
@@ -64,9 +86,17 @@ struct alignas(common::Constants::BLOCK_SIZE) RawBlock {
   /**
    * Contents of the raw block.
    */
-  byte content_[common::Constants::BLOCK_SIZE - 2 * sizeof(uint32_t) - sizeof(BlockAccessController)];
+  byte content_[common::Constants::BLOCK_SIZE - sizeof(uintptr_t) - sizeof(uint16_t) - sizeof(layout_version_t) -
+                sizeof(uint32_t) - sizeof(BlockAccessController)];
   // A Block needs to always be aligned to 1 MB, so we can get free bytes to
-  // store offsets within a block in ine 8-byte word.
+  // store offsets within a block in one 8-byte word
+
+  /**
+   * Get the offset of this block. Because the first bit insert_head_ is used to indicate the status
+   * of the block, we need to clear the status bit to get the real offset
+   * @return the offset which tells us where the next insertion should take place
+   */
+  uint32_t GetInsertHead() { return INT32_MAX & insert_head_.load(); }
 };
 
 /**
@@ -179,14 +209,13 @@ using ProjectionMap = std::unordered_map<catalog::col_oid_t, uint16_t>;
 
 /**
  * Denote whether a record modifies the logical delete column, used when DataTable inspects deltas
- * TODO(Matt): could be used by the GC for recycling
  */
 enum class DeltaRecordType : uint8_t { UPDATE = 0, INSERT, DELETE };
 
 /**
  * Types of LogRecords
  */
-enum class LogRecordType : uint8_t { REDO = 1, DELETE, COMMIT };
+enum class LogRecordType : uint8_t { REDO = 1, DELETE, COMMIT, ABORT };
 
 /**
  * A varlen entry is always a 32-bit size field and the varlen content,
@@ -204,7 +233,7 @@ class VarlenEntry {
    *                    be freed by the GC, which simply calls delete.
    * @return constructed VarlenEntry object
    */
-  static VarlenEntry Create(byte *content, uint32_t size, bool reclaim) {
+  static VarlenEntry Create(const byte *content, uint32_t size, bool reclaim) {
     VarlenEntry result;
     TERRIER_ASSERT(size > InlineThreshold(), "small varlen values should be inlined");
     result.size_ = reclaim ? size : (INT32_MIN | size);  // the first bit denotes whether we can reclaim it
@@ -278,6 +307,51 @@ class VarlenEntry {
    */
   std::string_view StringView() const {
     return std::string_view(reinterpret_cast<const char *const>(Content()), Size());
+  }
+
+  /**
+   * Deserializes all elements of type T into a returned vector from this varlen
+   * @tparam T type of elements that are serialized into this varlen entry
+   * @return a vector of immutable deserialized T objects from this varlen entry
+   * @warning It is the programmer's responsibility to ensure that the returned vector doesn't outlive the VarlenEntry
+   */
+  template <typename T>
+  std::vector<T> DeserializeArray() const {
+    const byte *contents = Content();
+    size_t num_elements = *reinterpret_cast<const size_t *>(contents);
+    TERRIER_ASSERT(sizeof(T) == (Size() - sizeof(size_t)) / num_elements,
+                   "Deserializing the wrong element types from array");
+    const T *payload = reinterpret_cast<const T *>(contents + sizeof(size_t));
+    return std::vector<T>(payload, payload + num_elements);
+  }
+
+  // TODO(tanujnay112): Generalize to return other read-only varlen types
+  /**
+   * Deserializes all elements of std::string type into a returned vector from this varlen
+   * @return a vector of string_view objects from this varlen entry
+   * @warning It is the programmer's responsibility to ensure that the returned vector doesn't outlive the VarlenEntry
+   * @warning Assuming this varlen is serialized in the format specified by
+   * StorageUtils::CreateVarlen(const std::vector<const std::string> &vec)
+   */
+  std::vector<std::string_view> DeserializeArrayVarlen() const {
+    std::vector<std::string_view> vec;
+    uint32_t to_read = Size();
+    uint32_t num_read = 0;
+
+    const char *contents = reinterpret_cast<const char *>(Content());
+    size_t num_elements = *reinterpret_cast<const size_t *>(contents);
+    const char *payload = contents + sizeof(size_t);
+
+    size_t length;
+    while (num_read < to_read && vec.size() < num_elements) {
+      length = *reinterpret_cast<const size_t *>(payload);
+      payload += sizeof(size_t);
+      vec.emplace_back(payload, length);
+      payload += length;
+      num_read += sizeof(size_t) + length;
+    }
+
+    return vec;
   }
 
  private:

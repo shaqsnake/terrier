@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "common/json_header.h"
 #include "common/macros.h"
 
 namespace terrier::common {
@@ -45,12 +46,22 @@ namespace terrier::common {
  * int result = !foo(a(42), b(10));
  *
  * This works with all types of ints.
+ *
+ * In order to use this macro, you need to use STRONG_TYPEDEF_HEADER in the .h file, then
+ * include common/strong_typedef_body.h in the corresponding .cpp file and use
+ * STRONG_TYPEDEF_BODY with the same arguements. Finally, you need to add an explicit instantation
+ * of the template in common/strong_typedef.cpp.
+ *
  */
-#define STRONG_TYPEDEF(name, underlying_type) \
-  namespace tags {                            \
-  struct name##_typedef_tag {};               \
-  }                                           \
-  using name = ::terrier::common::StrongTypeAlias<tags::name##_typedef_tag, underlying_type>;
+#define STRONG_TYPEDEF_HEADER(name, underlying_type)                                          \
+  namespace tags {                                                                            \
+  struct name##_typedef_tag {};                                                               \
+  }                                                                                           \
+  using name = ::terrier::common::StrongTypeAlias<tags::name##_typedef_tag, underlying_type>; \
+  namespace tags {                                                                            \
+  void to_json(nlohmann::json &j, const name &c);   /* NOLINT */                              \
+  void from_json(const nlohmann::json &j, name &c); /* NOLINT */                              \
+  }
 
 /**
  * A StrongTypeAlias is the underlying implementation of STRONG_TYPEDEF.
@@ -71,17 +82,22 @@ class StrongTypeAlias {
    * Constructs a new StrongTypeAlias.
    * @param val const reference to the underlying type.
    */
-  explicit StrongTypeAlias(const IntType &val) : val_(val) {}
+  constexpr explicit StrongTypeAlias(const IntType &val) : val_(val) {}
   /**
    * Move constructs a new StrongTypeAlias.
    * @param val const reference to the underlying type.
    */
-  explicit StrongTypeAlias(IntType &&val) : val_(std::move(val)) {}
+  constexpr explicit StrongTypeAlias(IntType &&val) : val_(std::move(val)) {}
 
   /**
    * @return the underlying value.
    */
-  const IntType &operator!() const { return val_; }
+  constexpr IntType &operator!() { return val_; }
+
+  /**
+   * @return the underlying value.
+   */
+  constexpr const IntType &operator!() const { return val_; }
 
   /**
    * @return the underlying value
@@ -200,6 +216,16 @@ class StrongTypeAlias {
    */
   friend std::ostream &operator<<(std::ostream &os, const StrongTypeAlias &alias) { return os << alias.val_; }
 
+  /**
+   * @return underlying value serialized to json
+   */
+  nlohmann::json ToJson() const;
+
+  /**
+   * @param j json to deserialize
+   */
+  void FromJson(const nlohmann::json &j);
+
  private:
   IntType val_;
 };
@@ -208,7 +234,10 @@ class StrongTypeAlias {
 /* Define all typedefs here */
 namespace terrier {
 using byte = std::byte;
-}
+using int128_t = __int128;
+using uint128_t = unsigned __int128;
+using hash_t = uint64_t;
+}  // namespace terrier
 
 namespace std {
 // TODO(Tianyu): Expand this specialization if needed.
@@ -241,14 +270,16 @@ struct atomic<terrier::common::StrongTypeAlias<Tag, IntType>> {
    * Checks if the atomic object is lock-free.
    * @return true if the atomic operations on the objects of this type are lock-free, false otherwise.
    */
-  bool is_lock_free() const noexcept { return underlying_.is_lock_free(); }
+  bool is_lock_free() const noexcept {  // NOLINT match underlying API
+    return underlying_.is_lock_free();
+  }
 
   /**
    * Atomically replaces the current value with desired. Memory is affected according to the value of order.
    * @param desired	the value to store into the atomic variable.
    * @param order memory order constraints to enforce.
    */
-  void store(t desired, memory_order order = memory_order_seq_cst) volatile noexcept {
+  void store(t desired, memory_order order = memory_order_seq_cst) volatile noexcept {  // NOLINT match underlying API
     underlying_.store(!desired, order);
   }
 
@@ -258,7 +289,9 @@ struct atomic<terrier::common::StrongTypeAlias<Tag, IntType>> {
    * @param order memory order constraints to enforce.
    * @return The current value of the atomic variable.
    */
-  t load(memory_order order = memory_order_seq_cst) const volatile noexcept { return t(underlying_.load(order)); }
+  t load(memory_order order = memory_order_seq_cst) const volatile noexcept {  // NOLINT match underlying API
+    return t(underlying_.load(order));
+  }
 
   /**
    * Atomically replaces the underlying value with desired. The operation is read-modify-write operation.
@@ -267,7 +300,7 @@ struct atomic<terrier::common::StrongTypeAlias<Tag, IntType>> {
    * @param order memory order constraints to enforce.
    * @return The value of the atomic variable before the call.
    */
-  t exchange(t desired, memory_order order = memory_order_seq_cst) volatile noexcept {
+  t exchange(t desired, memory_order order = memory_order_seq_cst) volatile noexcept {  // NOLINT match underlying API
     return t(underlying_.exchange(!desired, order));
   }
 

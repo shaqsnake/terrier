@@ -1,11 +1,12 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+
 #include "storage/data_table.h"
+#include "test_util/multithread_test_util.h"
+#include "test_util/storage_test_util.h"
+#include "test_util/test_harness.h"
 #include "transaction/transaction_context.h"
-#include "util/multithread_test_util.h"
-#include "util/storage_test_util.h"
-#include "util/test_harness.h"
 
 namespace terrier {
 class FakeTransaction {
@@ -16,7 +17,7 @@ class FakeTransaction {
       : layout_(layout),
         table_(table),
         null_bias_(null_bias),
-        txn_(start_time, txn_id, buffer_pool, LOGGING_DISABLED, ACTION_FRAMEWORK_DISABLED) {}
+        txn_(start_time, txn_id, common::ManagedPointer(buffer_pool), DISABLED) {}
 
   ~FakeTransaction() {
     for (auto ptr : loose_pointers_) delete[] ptr;
@@ -30,7 +31,7 @@ class FakeTransaction {
     storage::ProjectedRow *redo = redo_initializer_.InitializeRow(redo_buffer);
     StorageTestUtil::PopulateRandomRow(redo, layout_, null_bias_, generator);
 
-    storage::TupleSlot slot = table_->Insert(&txn_, *redo);
+    storage::TupleSlot slot = table_->Insert(common::ManagedPointer(&txn_), *redo);
     inserted_slots_.push_back(slot);
     reference_tuples_.emplace(slot, redo);
     return slot;
@@ -41,12 +42,12 @@ class FakeTransaction {
     // generate random update
     std::vector<storage::col_id_t> update_col_ids = StorageTestUtil::ProjectionListRandomColumns(layout_, generator);
     storage::ProjectedRowInitializer update_initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(layout_, update_col_ids);
+        storage::ProjectedRowInitializer::Create(layout_, update_col_ids);
     auto *update_buffer = common::AllocationUtil::AllocateAligned(update_initializer.ProjectedRowSize());
     storage::ProjectedRow *update = update_initializer.InitializeRow(update_buffer);
     StorageTestUtil::PopulateRandomRow(update, layout_, null_bias_, generator);
 
-    bool result = table_->Update(&txn_, slot, *update);
+    bool result = table_->Update(common::ManagedPointer(&txn_), slot, *update);
     // the update buffer does not need to live past this scope
     delete[] update_buffer;
     return result;
@@ -65,8 +66,8 @@ class FakeTransaction {
   const storage::BlockLayout &layout_;
   storage::DataTable *table_;
   double null_bias_;
-  storage::ProjectedRowInitializer redo_initializer_ = storage::ProjectedRowInitializer::CreateProjectedRowInitializer(
-      layout_, StorageTestUtil::ProjectionListAllColumns(layout_));
+  storage::ProjectedRowInitializer redo_initializer_ =
+      storage::ProjectedRowInitializer::Create(layout_, StorageTestUtil::ProjectionListAllColumns(layout_));
   // All data structures here are only accessed thread-locally so no need
   // for concurrent versions
   std::vector<storage::TupleSlot> inserted_slots_;
@@ -92,9 +93,12 @@ TEST_F(DataTableConcurrentTests, ConcurrentInsert) {
   const uint16_t max_columns = 20;
   const uint32_t num_threads = MultiThreadTestUtil::HardwareConcurrency();
   common::WorkerPool thread_pool(num_threads, {});
+  thread_pool.Startup();
+
   for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
     storage::BlockLayout layout = StorageTestUtil::RandomLayoutNoVarlen(max_columns, &generator_);
-    storage::DataTable tested(&block_store_, layout, storage::layout_version_t(0));
+    storage::DataTable tested(common::ManagedPointer<storage::BlockStore>(&block_store_), layout,
+                              storage::layout_version_t(0));
     std::vector<std::unique_ptr<FakeTransaction>> fake_txns;
     for (uint32_t thread = 0; thread < num_threads; thread++)
       // timestamps are irrelevant for inserts
@@ -107,13 +111,12 @@ TEST_F(DataTableConcurrentTests, ConcurrentInsert) {
     };
     MultiThreadTestUtil::RunThreadsUntilFinish(&thread_pool, num_threads, workload);
     storage::ProjectedRowInitializer select_initializer =
-        storage::ProjectedRowInitializer::CreateProjectedRowInitializer(
-            layout, StorageTestUtil::ProjectionListAllColumns(layout));
+        storage::ProjectedRowInitializer::Create(layout, StorageTestUtil::ProjectionListAllColumns(layout));
     auto *select_buffer = common::AllocationUtil::AllocateAligned(select_initializer.ProjectedRowSize());
     for (auto &fake_txn : fake_txns) {
       for (auto slot : fake_txn->InsertedTuples()) {
         storage::ProjectedRow *select_row = select_initializer.InitializeRow(select_buffer);
-        tested.Select(fake_txn->GetTxn(), slot, select_row);
+        tested.Select(common::ManagedPointer(fake_txn->GetTxn()), slot, select_row);
         EXPECT_TRUE(StorageTestUtil::ProjectionListEqualShallow(layout, fake_txn->GetReferenceTuple(slot), select_row));
       }
     }
@@ -130,9 +133,12 @@ TEST_F(DataTableConcurrentTests, ConcurrentUpdateOneWriterWins) {
   const uint16_t max_columns = 20;
   const uint32_t num_threads = MultiThreadTestUtil::HardwareConcurrency();
   common::WorkerPool thread_pool(num_threads, {});
+  thread_pool.Startup();
+
   for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
     storage::BlockLayout layout = StorageTestUtil::RandomLayoutNoVarlen(max_columns, &generator_);
-    storage::DataTable tested(&block_store_, layout, storage::layout_version_t(0));
+    storage::DataTable tested(common::ManagedPointer<storage::BlockStore>(&block_store_), layout,
+                              storage::layout_version_t(0));
     FakeTransaction insert_txn(layout, &tested, null_ratio_(generator_), transaction::timestamp_t(0),
                                transaction::timestamp_t(1), &buffer_pool_);
     // Insert one tuple, the timestamp needs to show committed

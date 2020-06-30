@@ -4,8 +4,8 @@
 
 #include "common/worker_pool.h"
 #include "gtest/gtest.h"
-#include "util/multithread_test_util.h"
-#include "util/random_test_util.h"
+#include "test_util/multithread_test_util.h"
+#include "test_util/random_test_util.h"
 
 namespace terrier {
 
@@ -14,6 +14,7 @@ namespace terrier {
 TEST(WorkerPoolTests, BasicTest) {
   common::TaskQueue tasks;
   common::WorkerPool thread_pool(5, tasks);
+  thread_pool.Startup();
   std::atomic<int> counter(0);
 
   int var1 = 1;
@@ -61,13 +62,14 @@ TEST(WorkerPoolTests, BasicTest) {
 TEST(WorkerPoolTests, MoreTest) {
   common::TaskQueue tasks;
   common::WorkerPool thread_pool(5, tasks);
+  thread_pool.Startup();
   uint32_t iteration = 10;
-  std::default_random_engine generator_;
+  std::default_random_engine generator;
   std::uniform_int_distribution<uint32_t> num_thread{1, MultiThreadTestUtil::HardwareConcurrency()};
   for (uint32_t it = 0; it < iteration; it++) {
-    auto workload = [](uint32_t) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); };
+    auto workload = [](uint32_t /*unused*/) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); };
 
-    MultiThreadTestUtil::RunThreadsUntilFinish(&thread_pool, num_thread(generator_), workload);
+    MultiThreadTestUtil::RunThreadsUntilFinish(&thread_pool, num_thread(generator), workload);
   }
   thread_pool.Shutdown();
 }

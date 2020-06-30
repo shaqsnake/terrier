@@ -37,7 +37,7 @@ if (${TERRIER_USE_ASAN})
       message(SEND_ERROR "Cannot use dynamic linking when ASAN and UBSAN are both enabled")
     endif ()
   endif ()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -DADDRESS_SANITIZER")
+  set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fsanitize=address")
   message(STATUS "AddressSanitizer enabled.")
 endif ()
 
@@ -90,15 +90,6 @@ if (${TERRIER_USE_TSAN})
   endif ()
 endif ()
 
-if (${TERRIER_USE_COVERAGE})
-  if (NOT ("${COMPILER_FAMILY}" STREQUAL "clang"))
-    message(SEND_ERROR "You can only enable coverage with clang")
-  endif ()
-  add_definitions("-fsanitize-coverage=trace-pc-guard")
-
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize-coverage=trace-pc-guard")
-endif ()
-
 if ("${TERRIER_USE_UBSAN}" OR "${TERRIER_USE_ASAN}" OR "${TERRIER_USE_TSAN}")
   # GCC 4.8 and 4.9 (latest as of this writing) don't allow you to specify a
   # sanitizer blacklist.
@@ -110,7 +101,7 @@ if ("${TERRIER_USE_UBSAN}" OR "${TERRIER_USE_ASAN}" OR "${TERRIER_USE_TSAN}")
           " Detected unsupported version ${COMPILER_VERSION}."
           " Try using clang from $NATIVE_TOOLCHAIN/.")
     endif ()
-    add_definitions("-fsanitize-blacklist=${BUILD_SUPPORT_DIR}/sanitize-blacklist.txt")
+    add_definitions("-fsanitize-blacklist=${BUILD_SUPPORT_DATA_DIR}/sanitize_suppressions.txt")
   else ()
     message(WARNING "GCC does not support specifying a sanitizer blacklist. Known sanitizer check failures will not be suppressed.")
   endif ()

@@ -1,46 +1,32 @@
-#include <vector>
+#include <random>
+
+#include "common/managed_pointer.h"
 #include "gtest/gtest.h"
-#include "storage/garbage_collector.h"
-#include "util/transaction_test_util.h"
+#include "main/db_main.h"
+#include "test_util/data_table_test_util.h"
+#include "transaction/deferred_action_manager.h"
 
 namespace terrier {
 class LargeGCTests : public TerrierTest {
  public:
-  void StartGC(transaction::TransactionManager *const txn_manager) {
-    gc_ = new storage::GarbageCollector(txn_manager);
-    run_gc_ = true;
-    gc_thread_ = std::thread([this] { GCThreadLoop(); });
-  }
+  void RunTest(const LargeDataTableTestConfiguration &config) {
+    for (uint32_t iteration = 0; iteration < config.NumIterations(); iteration++) {
+      std::default_random_engine generator;
 
-  void EndGC() {
-    run_gc_ = false;
-    gc_thread_.join();
-    // Make sure all garbage is collected. This take 2 runs for unlink and deallocate
-    gc_->PerformGarbageCollection();
-    gc_->PerformGarbageCollection();
-    delete gc_;
-  }
+      auto db_main = DBMain::Builder().SetUseGC(true).SetUseGCThread(true).Build();
+      auto *const tested = new LargeDataTableTestObject(config, db_main->GetStorageLayer()->GetBlockStore().Get(),
+                                                        db_main->GetTransactionLayer()->GetTransactionManager().Get(),
+                                                        &generator, DISABLED);
 
-  const uint32_t num_iterations = 10;
-  const uint16_t max_columns = 20;
-  const uint32_t initial_table_size = 1000;
-  const uint32_t num_txns = 1000;
-  const uint32_t batch_size = 100;
-  storage::BlockStore block_store_{1000, 1000};
-  storage::RecordBufferSegmentPool buffer_pool_{10000, 10000};
-  std::default_random_engine generator_;
-  volatile bool run_gc_ = false;
-  volatile bool gc_paused_ = false;
-  std::thread gc_thread_;
-  storage::GarbageCollector *gc_ = nullptr;
-
- private:
-  const std::chrono::milliseconds gc_period_{10};
-
-  void GCThreadLoop() {
-    while (run_gc_) {
-      std::this_thread::sleep_for(gc_period_);
-      if (!gc_paused_) gc_->PerformGarbageCollection();
+      for (uint32_t batch = 0; batch * config.BatchSize() < config.NumTxns(); batch++) {
+        auto result = tested->SimulateOltp(config.BatchSize(), config.NumConcurrentTxns());
+        db_main->GetGarbageCollectorThread()->PauseGC();
+        tested->CheckReadsCorrect(&result.first);
+        for (auto w : result.first) delete w;
+        for (auto w : result.second) delete w;
+        db_main->GetGarbageCollectorThread()->ResumeGC();
+      }
+      db_main->GetTransactionLayer()->GetDeferredActionManager()->RegisterDeferredAction([=]() { delete tested; });
     }
   }
 };
@@ -51,257 +37,137 @@ class LargeGCTests : public TerrierTest {
 // to make sure they are the same.
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, MixedReadWriteWithGC) {
-  const uint32_t txn_length = 10;
-  const std::vector<double> update_select_ratio = {0.5, 0.5};
-  const uint32_t num_concurrent_txns = MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.5, 0.5})
+                    .SetTxnLength(10)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 
 // Double the thread count to force more thread swapping and try to capture unexpected races
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, MixedReadWriteHighThreadWithGC) {
-  const uint32_t txn_length = 10;
-  const std::vector<double> update_select_ratio = {0.5, 0.5};
-  const uint32_t num_concurrent_txns = 2 * MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(2 * MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.5, 0.5})
+                    .SetTxnLength(10)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 
 // This test targets the scenario of low abort rate (~1% of num_txns) and high throughput of statements
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, LowAbortHighThroughputWithGC) {
-  const uint32_t txn_length = 1;
-  const std::vector<double> update_select_ratio = {0.5, 0.5};
-  const uint32_t num_concurrent_txns = MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.5, 0.5})
+                    .SetTxnLength(1)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 
 // This test is a duplicate of LowAbortHighThroughputWithGC but with higher number of thread swapouts
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, LowAbortHighThroughputHighThreadWithGC) {
-  const uint32_t txn_length = 1;
-  const std::vector<double> update_select_ratio = {0.5, 0.5};
-  const uint32_t num_concurrent_txns = 2 * MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(2 * MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.5, 0.5})
+                    .SetTxnLength(1)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 
 // This test is similar to the previous one, but with a higher ratio of updates
 // and longer transactions leading to more aborts.
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, HighAbortRateWithGC) {
-  const uint32_t txn_length = 40;
-  const std::vector<double> update_select_ratio = {0.8, 0.2};
-  const uint32_t num_concurrent_txns = MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.8, 0.2})
+                    .SetTxnLength(40)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 
 // This test duplicates the previous one with a higher number of thread swapouts.
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, HighAbortRateHighThreadWithGC) {
-  const uint32_t txn_length = 40;
-  const std::vector<double> update_select_ratio = {0.8, 0.2};
-  const uint32_t num_concurrent_txns = 2 * MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(2 * MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.8, 0.2})
+                    .SetTxnLength(40)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 
 // This test attempts to simulate a TPC-C-like scenario.
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, TPCCishWithGC) {
-  const uint32_t txn_length = 5;
-  const std::vector<double> update_select_ratio = {0.4, 0.6};
-  const uint32_t num_concurrent_txns = MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.4, 0.6})
+                    .SetTxnLength(5)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 
 // This test duplicates the previous one with a higher number of thread swapouts.
 // NOLINTNEXTLINE
 TEST_F(LargeGCTests, TPCCishHighThreadWithGC) {
-  const uint32_t txn_length = 5;
-  const std::vector<double> update_select_ratio = {0.4, 0.6};
-  const uint32_t num_concurrent_txns = 2 * MultiThreadTestUtil::HardwareConcurrency();
-  for (uint32_t iteration = 0; iteration < num_iterations; iteration++) {
-    LargeTransactionTestObject tested = LargeTransactionTestObject::Builder()
-                                            .SetMaxColumns(max_columns)
-                                            .SetInitialTableSize(initial_table_size)
-                                            .SetTxnLength(txn_length)
-                                            .SetUpdateSelectRatio(update_select_ratio)
-                                            .SetBlockStore(&block_store_)
-                                            .SetBufferPool(&buffer_pool_)
-                                            .SetGenerator(&generator_)
-                                            .SetGcOn(true)
-                                            .SetBookkeeping(true)
-                                            .SetVarlenAllowed(true)
-                                            .build();
-    StartGC(tested.GetTxnManager());
-    for (uint32_t batch = 0; batch * batch_size < num_txns; batch++) {
-      auto result = tested.SimulateOltp(batch_size, num_concurrent_txns);
-      gc_paused_ = true;
-      tested.CheckReadsCorrect(&result.first);
-      for (auto w : result.first) delete w;
-      for (auto w : result.second) delete w;
-      gc_paused_ = false;
-    }
-    EndGC();
-  }
+  auto config = LargeDataTableTestConfiguration::Builder()
+                    .SetNumIterations(10)
+                    .SetNumTxns(1000)
+                    .SetBatchSize(100)
+                    .SetNumConcurrentTxns(2 * MultiThreadTestUtil::HardwareConcurrency())
+                    .SetUpdateSelectRatio({0.4, 0.6})
+                    .SetTxnLength(5)
+                    .SetInitialTableSize(1000)
+                    .SetMaxColumns(20)
+                    .SetVarlenAllowed(true)
+                    .Build();
+  RunTest(config);
 }
 }  // namespace terrier

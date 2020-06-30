@@ -1,32 +1,34 @@
 #pragma once
 
 #include <arpa/inet.h>
-#include <netinet/tcp.h>
-#include <sys/file.h>
-
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 #include <event2/event.h>
 #include <event2/listener.h>
-#include <unordered_map>
+#include <netinet/tcp.h>
+#include <sys/file.h>
 
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "common/exception.h"
+#include "common/error/exception.h"
+#include "common/managed_pointer.h"
 #include "loggers/network_logger.h"
-
+#include "network/connection_context.h"
 #include "network/connection_handler_task.h"
 #include "network/network_io_wrapper.h"
 #include "network/network_types.h"
-#include "network/postgres_protocol_interpreter.h"
+#include "network/postgres/postgres_command_factory.h"
+#include "network/postgres/postgres_protocol_interpreter.h"
 #include "network/protocol_interpreter.h"
-
+#include "traffic_cop/traffic_cop.h"
 namespace terrier::network {
 
 /**
@@ -34,6 +36,8 @@ namespace terrier::network {
  * a client connection for its entire duration. This includes a state machine
  * and the necessary libevent infrastructure for a handler to work on this
  * connection.
+ *
+ * State not related to the network state machine probably doesn't belong here, but rather in the ConnectionContext.
  */
 class ConnectionHandle {
  public:
@@ -41,8 +45,21 @@ class ConnectionHandle {
    * Constructs a new ConnectionHandle
    * @param sock_fd Client's connection fd
    * @param handler The handler responsible for this handle
+   * @param tcop The pointer to the traffic cop
+   * @param interpreter protocol interpreter to use for this connection handle
    */
-  ConnectionHandle(int sock_fd, ConnectionHandlerTask *handler);
+  ConnectionHandle(int sock_fd, common::ManagedPointer<ConnectionHandlerTask> handler,
+                   common::ManagedPointer<trafficcop::TrafficCop> tcop,
+                   std::unique_ptr<ProtocolInterpreter> interpreter)
+      : io_wrapper_(std::make_unique<NetworkIoWrapper>(sock_fd)),
+        conn_handler_(handler),
+        traffic_cop_(tcop),
+        protocol_interpreter_(std::move(interpreter)) {
+    context_.SetCallback(Callback, this);
+    context_.SetConnectionID(static_cast<connection_id_t>(sock_fd));
+  }
+
+  ~ConnectionHandle() { context_.Reset(); }
 
   /**
    * Disable copying and moving ConnectionHandle instances
@@ -67,7 +84,7 @@ class ConnectionHandle {
   }
 
   /**
-   * Handles a libevent event. This simply delegates the the state machine.
+   * Handles a libevent event. This simply delegates to the state machine.
    */
   void HandleEvent(int fd, int16_t flags) {
     Transition t;
@@ -77,10 +94,9 @@ class ConnectionHandle {
     } else {
       t = Transition ::WAKEUP;
     }
-    state_machine_.Accept(t, *this);
+    state_machine_.Accept(t, common::ManagedPointer<ConnectionHandle>(this));
   }
 
-  /* State Machine Actions */
   /**
    * @brief Tries to read from the event port onto the read buffer
    * @return The transition to trigger in the state machine after
@@ -102,8 +118,9 @@ class ConnectionHandle {
    * @return The transition to trigger in the state machine after
    */
   Transition Process() {
-    return protocol_interpreter_->Process(io_wrapper_->GetReadBuffer(), io_wrapper_->GetWriteQueue(),
-                                          [=] { event_active(workpool_event_, EV_WRITE, 0); });
+    auto transition = protocol_interpreter_->Process(io_wrapper_->GetReadBuffer(), io_wrapper_->GetWriteQueue(),
+                                                     traffic_cop_, common::ManagedPointer(&context_));
+    return transition;
   }
 
   /**
@@ -147,6 +164,17 @@ class ConnectionHandle {
    */
   void StopReceivingNetworkEvent() { EventUtil::EventDel(network_event_); }
 
+  /**
+   * issues a libevent to wake up the state machine in the WAIT_ON_TERRIER state
+   * @param callback_args this for a ConnectionHandle in WAIT_ON_TERRIER state
+   */
+  static void Callback(void *callback_args) {
+    auto *const handle = reinterpret_cast<ConnectionHandle *>(callback_args);
+    TERRIER_ASSERT(handle->state_machine_.CurrentState() == ConnState::PROCESS,
+                   "Should be waking up a ConnectionHandle that's in PROCESS state waiting on query result.");
+    event_active(handle->workpool_event_, EV_WRITE, 0);
+  }
+
  private:
   /**
    * A state machine is defined to be a set of states, a set of symbols it
@@ -165,7 +193,7 @@ class ConnectionHandle {
    */
   class StateMachine {
    public:
-    using action = Transition (*)(ConnectionHandle &);
+    using action = Transition (*)(const common::ManagedPointer<ConnectionHandle>);
     using transition_result = std::pair<ConnState, action>;
     /**
      * Runs the internal state machine, starting from the symbol given, until no
@@ -187,10 +215,9 @@ class ConnectionHandle {
      * @param action starting symbol
      * @param connection the network connection object to apply actions to
      */
-    void Accept(Transition action, ConnectionHandle &connection);  // NOLINT
-    // clang-tidy is suppressed here as it complains about the reference param having
-    // no const qualifier as this must be casted into a (void*) to pass as an argument to METHOD_AS_CALLBACK
-    // in the forward dependencies of Accept in the state_machine
+    void Accept(Transition action, common::ManagedPointer<ConnectionHandle> connection);
+
+    ConnState CurrentState() const { return current_state_; }
 
    private:
     /**
@@ -198,19 +225,23 @@ class ConnectionHandle {
      * behavior and the
      * next state it should go to.
      */
-    static transition_result Delta_(ConnState state, Transition transition);
+    static transition_result Delta(ConnState state, Transition transition);
     ConnState current_state_ = ConnState::READ;
   };
 
   friend class StateMachine;
   friend class ConnectionHandleFactory;
 
-  // A raw pointer is used here because references cannot be rebound.
-  ConnectionHandlerTask *conn_handler_;
   std::unique_ptr<NetworkIoWrapper> io_wrapper_;
-  // TODO(Tianyu): Probably use a factory for this
+  common::ManagedPointer<ConnectionHandlerTask> conn_handler_;
+  common::ManagedPointer<trafficcop::TrafficCop> traffic_cop_;
   std::unique_ptr<ProtocolInterpreter> protocol_interpreter_;
+
   StateMachine state_machine_{};
   struct event *network_event_ = nullptr, *workpool_event_ = nullptr;
+
+  // TODO(Tianyu): Do we want to flatten this struct out into connection handle, or is this current separation
+  // sensible?
+  ConnectionContext context_;
 };
 }  // namespace terrier::network

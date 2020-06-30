@@ -1,11 +1,19 @@
 #pragma once
 
+#include <memory>
 #include <unordered_map>
 
+#include "common/dedicated_thread_registry.h"
 #include "network/connection_handle.h"
-#include "network/terrier_server.h"
+
+namespace terrier::trafficcop {
+class TrafficCop;
+}  // namespace terrier::trafficcop
 
 namespace terrier::network {
+
+class ConnectionHandlerTask;
+class ProtocolInterpreter;
 
 /**
  * @brief Factory class for constructing ConnectionHandle objects
@@ -21,12 +29,10 @@ namespace terrier::network {
 class ConnectionHandleFactory {
  public:
   /**
-   * @return The singleton instance of a ConnectionHandleFactory
+   * Builds a new connection handle factory.
+   * @param tcop The pointer to the traffic cop
    */
-  static ConnectionHandleFactory &GetInstance() {
-    static ConnectionHandleFactory factory;
-    return factory;
-  }
+  explicit ConnectionHandleFactory(common::ManagedPointer<trafficcop::TrafficCop> tcop) : traffic_cop_(tcop) {}
 
   /**
    * @brief Creates or re-purpose a NetworkIoWrapper object for new use.
@@ -34,20 +40,19 @@ class ConnectionHandleFactory {
    * converted.
    * @see NetworkIoWrapper for details
    * @param conn_fd Client connection fd
-   * @param task The connection handler task to assign to returned ConnectionHandle object
+   * @param interpreter The protocol interpreter to use for this connection handle
+   * @param handler The connection handler task to assign to returned ConnectionHandle object
    * @return A new ConnectionHandle object
    */
-  ConnectionHandle &NewConnectionHandle(int conn_fd, ConnectionHandlerTask *task);
-
-  /**
-   * Teardown for connection handle factory to clean up anything in reusable_handles_
-   */
-  void TearDown() {
-    DedicatedThreadRegistry::GetInstance().TearDown();
-    reusable_handles_.clear();
-  }
+  ConnectionHandle &NewConnectionHandle(int conn_fd, std::unique_ptr<ProtocolInterpreter> interpreter,
+                                        common::ManagedPointer<ConnectionHandlerTask> handler);
 
  private:
+  /**
+   * latch needed to protect multiple threads accessing reusable_handles_
+   */
+  common::SpinLatch reusable_handles_latch_;
   std::unordered_map<int, ConnectionHandle> reusable_handles_;
+  common::ManagedPointer<trafficcop::TrafficCop> traffic_cop_;
 };
 }  // namespace terrier::network
